@@ -1,0 +1,5 @@
+# 保证 Windows 脚本以 CRLF 检出（PowerShell / 批处理下的最佳兼容写法）
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.md  text eol=lf
+*.json text eol=lf
