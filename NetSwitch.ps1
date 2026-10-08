@@ -40,10 +40,81 @@ $script:AppName    = 'NetSwitch'
 $script:Version    = '1.0.0'
 $script:IsCliMode  = $false
 $script:LogBox     = $null
+$script:LogFile    = ''
 $script:ConfigFile = ''
 $script:ConfigData = $null
 
 # ============================== 通用工具函数 ==============================
+
+# 把一行内容追加到日志文件，写失败也绝不影响主流程
+function Write-LogFileLine {
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($script:LogFile)) { return }
+    try {
+        Add-Content -LiteralPath $script:LogFile -Value $Line -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        # 忽略：日志不可写不代表功能不可用
+    }
+}
+
+# 启动日志并记录一次运行环境的快照，方便事后排查问题
+function Initialize-Logging {
+    $script:LogFile = ''
+
+    # 依次尝试：脚本目录 -> %APPDATA%\NetSwitch -> 系统临时目录，取第一个可写的
+    $candidates = @()
+    if ($PSScriptRoot) { $candidates += (Join-Path $PSScriptRoot 'NetSwitch.log') }
+    $appData = ''
+    try { $appData = [Environment]::GetFolderPath('ApplicationData') } catch { }
+    if ($appData) { $candidates += (Join-Path $appData 'NetSwitch\NetSwitch.log') }
+    $candidates += (Join-Path ([System.IO.Path]::GetTempPath()) 'NetSwitch.log')
+
+    foreach ($path in $candidates) {
+        try {
+            $dir = Split-Path -Parent $path
+            if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            # 试探写入，确认确实可写
+            [System.IO.File]::AppendAllText($path, '')
+            $script:LogFile = $path
+            break
+        } catch {
+            continue
+        }
+    }
+
+    $chosen = $script:LogFile
+
+    # 日志超过 1MB 时只保留最近 500 行，避免长期无限增长
+    if ($chosen -and (Test-Path -LiteralPath $chosen)) {
+        try {
+            if ((Get-Item -LiteralPath $chosen).Length -gt 1MB) {
+                $tail = @(Get-Content -LiteralPath $chosen -Encoding UTF8 -Tail 500)
+                [System.IO.File]::WriteAllLines($chosen, $tail, (New-Object System.Text.UTF8Encoding($true)))
+            }
+        } catch { }
+    }
+
+    Write-NSLog '------------------------------------------------------------'
+    Write-NSLog "NetSwitch $script:Version 启动"
+    try {
+        Write-NSLog "环境: $([System.Environment]::OSVersion.VersionString) / PowerShell $($PSVersionTable.PSVersion.ToString())"
+    } catch { }
+    try {
+        Write-NSLog "用户: $([Environment]::UserName) / 已获取管理员权限: $(Test-IsAdmin)"
+    } catch { }
+    Write-NSLog "脚本路径: $PSCommandPath"
+    Write-NSLog "配置文件: $($script:ConfigFile)"
+    Write-NSLog "日志文件: $(if ($script:LogFile) { $script:LogFile } else { '（无可用写入位置，未启用落盘）' })"
+}
+
+# 把日志（默认最近 300 行）取出来，用于复制给开发者排查
+function Get-LogTail {
+    param([int]$Lines = 300)
+    if ([string]::IsNullOrWhiteSpace($script:LogFile) -or -not (Test-Path $script:LogFile)) { return '' }
+    $content = @(Get-Content -LiteralPath $script:LogFile -Encoding UTF8 -ErrorAction SilentlyContinue)
+    if ($content.Count -gt $Lines) { $content = $content[($content.Count - $Lines)..($content.Count - 1)] }
+    return ($content -join "`r`n")
+}
 
 function Write-NSLog {
     param(
@@ -56,7 +127,11 @@ function Write-NSLog {
         'ERROR' { '[ X ]' }
         default { '[ - ]' }
     }
-    $line = "$prefix $Message"
+    $plainLine = "$prefix $Message"
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $plainLine"
+
+    # 统一落盘，保证程序关闭后现场仍可追溯
+    Write-LogFileLine $line
 
     if ($script:LogBox) {
         try {
@@ -1251,14 +1326,16 @@ function Show-MainForm {
     $btnOpenFile.BackColor = $gray
     $btnOpenFile.ForeColor = [System.Drawing.Color]::White
 
-    $lblHint = New-Object System.Windows.Forms.Label
-    $lblHint.Text = '修改 IP 需管理员权限'
-    $lblHint.Location = New-Object System.Drawing.Point(750, 12)
-    $lblHint.Size = New-Object System.Drawing.Size(120, 30)
-    $lblHint.ForeColor = [System.Drawing.Color]::DimGray
-    $lblHint.Anchor = 'Top, Right'
+    $btnCopyLog = New-Object System.Windows.Forms.Button
+    $btnCopyLog.Text = '复制日志'
+    $btnCopyLog.Location = New-Object System.Drawing.Point(750, 6)
+    $btnCopyLog.Size = New-Object System.Drawing.Size(116, 36)
+    $btnCopyLog.FlatStyle = 'Flat'
+    $btnCopyLog.BackColor = [System.Drawing.Color]::FromArgb(90, 100, 120)
+    $btnCopyLog.ForeColor = [System.Drawing.Color]::White
+    $btnCopyLog.Anchor = 'Top, Right'
 
-    $action.Controls.AddRange(@($btnApply, $btnShortcut, $btnRefresh, $btnExport, $btnOpenFile, $lblHint))
+    $action.Controls.AddRange(@($btnApply, $btnShortcut, $btnRefresh, $btnExport, $btnOpenFile, $btnCopyLog))
 
     # 日志
     $grpLog = New-Object System.Windows.Forms.GroupBox
@@ -1468,6 +1545,21 @@ function Show-MainForm {
         }
     })
 
+    # 把日志复制出来，用户可以直接粘贴给开发者排查问题
+    $btnCopyLog.Add_Click({
+        try {
+            $text = Get-LogTail -Lines 300
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                Write-NSLog '暂无日志内容可复制。' 'WARN'
+                return
+            }
+            [System.Windows.Forms.Clipboard]::SetText($text)
+            Write-NSLog '日志最近 300 行已复制到剪贴板，可直接粘贴给开发者排查。' 'OK'
+        } catch {
+            Write-NSLog "复制日志失败：$($_.Exception.Message)" 'ERROR'
+        }
+    })
+
     $btnRefresh.Add_Click({
         & $refreshStatus
         Write-NSLog '已刷新网络状态'
@@ -1546,13 +1638,24 @@ foreach ($key in @('Apply', 'ListProfiles', 'ListAdapters', 'ShowStatus', 'Impor
 try {
     Assert-Environment
 } catch {
+    Initialize-Logging
+    Write-NSLog "环境检查失败：$($_.Exception.Message)" 'ERROR'
     Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host "详细信息已记录到日志文件：$($script:LogFile)" -ForegroundColor Yellow
     if (-not $cliRequested) {
         [System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '环境不支持', 'OK', 'Error') | Out-Null
     }
     exit 1
 }
+
+# 确定配置文件路径（命令行与图形界面共用），然后启动日志
+if ($PSBoundParameters.ContainsKey('ConfigPath') -and $ConfigPath) {
+    $script:ConfigFile = $ConfigPath
+} else {
+    $script:ConfigFile = Get-DefaultConfigPath
+}
+Initialize-Logging
 
 if ($cliRequested) {
     $script:IsCliMode = $true
@@ -1561,12 +1664,6 @@ if ($cliRequested) {
 }
 
 # 图形界面模式
-if ($PSBoundParameters.ContainsKey('ConfigPath') -and $ConfigPath) {
-    $script:ConfigFile = $ConfigPath
-} else {
-    $script:ConfigFile = Get-DefaultConfigPath
-}
-
 if (-not (Test-Path $script:ConfigFile)) {
     $script:ConfigData = Repair-ConfigData (New-DefaultData)
     Save-ConfigFile | Out-Null
@@ -1577,10 +1674,14 @@ if (-not (Test-Path $script:ConfigFile)) {
 try {
     Show-MainForm
 } catch {
-    Write-Host "界面启动失败：$($_.Exception.Message)" -ForegroundColor Red
+    $detail = $_.Exception.Message
+    Write-NSLog "界面启动失败：$detail" 'ERROR'
+    try { Write-LogFileLine ($_.ScriptStackTrace) } catch { }
+    Write-Host "界面启动失败：$detail" -ForegroundColor Red
     Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '请确认：1) 系统为 Windows 8 / Server 2012 及以上；2) 使用 Windows PowerShell 运行（PowerShell 7 亦可）；3) 脚本未被另存为 ANSI 编码。' -ForegroundColor Yellow
     Write-Host '也可以先试用命令行模式：NetSwitch.ps1 -ListProfiles' -ForegroundColor Yellow
+    if ($script:LogFile) { Write-Host "错误详情已写入日志文件：$($script:LogFile)" -ForegroundColor Yellow }
     exit 1
 }

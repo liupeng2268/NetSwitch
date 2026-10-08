@@ -122,6 +122,26 @@ powershell -ExecutionPolicy Bypass -File NetSwitch.ps1 -ImportFile team.json
 
 不会。默认读写脚本同目录的 `profiles.json`；只有在同目录不可写时才回退到 `%APPDATA%\NetSwitch\profiles.json`。也可以用 `-ConfigPath 路径` 显式指定。
 
-## 七、安全提示
+## 七、日志与出错求助
+
+工具会自动写日志，不用额外配置：
+
+| 项目 | 说明 |
+| --- | --- |
+| 日志位置 | 脚本同目录的 **`NetSwitch.log`** |
+| 记录内容 | 启动时的环境快照（系统 / PowerShell 版本 / 是否管理员 / 配置文件路径）、每次切换做了什么、每一步是否失败、失败的具体原因 |
+| 界面查看 | 主界面右下角「操作日志」面板实时显示，**窗口关闭也不会丢** |
+| 自动清理 | 超过 1MB 时只保留最近 500 行，不会无限增长 |
+| 快速导出 | 点右下角 **「复制日志」**，自动把最近 300 行复制到剪贴板 |
+
+**出错时怎么反馈**（推荐顺序）：
+
+1. 在界面点 **「复制日志」**，把内容直接粘贴过来 —— 里面已经有环境信息和出错行
+2. 若界面打不开，直接去脚本目录找 **`NetSwitch.log`**，把最后几十行发来
+3. 命令行模式同样会写日志：`NetSwitch.ps1 -Apply "配置集名"` 之后查看日志文件
+
+日志里会包含你的内网 IP 和 Windows 用户名，贴给别人之前留意一下是否需要脱敏。
+
+## 八、安全提示
 
 程序执行的所有底层命令都是 Windows 自带的 `NetTCPIP` 模块 cmdlet（`Get-NetAdapter`、`New-NetIPAddress`、`Set-NetIPInterface`、`Set-DnsClientServerAddress`、`New-NetRoute` 等），不涉及第三方驱动或注册表修改。切换前会清除网卡上已有的 IPv4 地址与默认网关，因此**建议先把当前环境存成一个配置集再开始用**。
