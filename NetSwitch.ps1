@@ -382,6 +382,147 @@ function Save-ConfigFile {
     Write-NSLog "配置已保存到 $Path" 'OK'
 }
 
+# ============================== 切换前自动备份 ==============================
+
+# 备份保留份数，超出的旧备份会被清理
+$script:BackupKeepCount = 10
+
+# 备份目录：与 profiles.json 同级的 backups 子目录
+function Get-BackupDirectory {
+    $base = $script:ConfigFile
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = Get-DefaultConfigPath }
+    $dir = Split-Path -Parent $base
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = $PSScriptRoot }
+    return (Join-Path $dir 'backups')
+}
+
+# 按名称倒序列出全部备份文件（新的在前）
+function Get-BackupFiles {
+    $dir = Get-BackupDirectory
+    if (-not (Test-Path $dir)) { return @() }
+    return @(Get-ChildItem -Path $dir -Filter 'NetSwitch-backup-*.json' -File -ErrorAction SilentlyContinue |
+             Sort-Object Name -Descending)
+}
+
+# 采集各网卡当前的 IPv4 / 掩码 / 网关 / DNS，组装成与 profiles.json 同构的配置集
+function Get-CurrentNetworkProfile {
+    $adapters = @()
+
+    foreach ($adapter in (Get-AdapterList)) {
+        $index = $adapter.InterfaceIndex
+
+        $entry = [pscustomobject][ordered]@{
+            adapter  = $adapter.Name
+            enabled  = $true
+            mode     = 'dhcp'
+            ip       = ''
+            mask     = ''
+            dhcpDns  = $true
+            gateways = @()
+            dns      = @()
+            routes   = @()
+        }
+
+        # 只有手动设置了静态地址才记录为 static，DHCP 获取到的地址不写死
+        try {
+            $dhcpState = (Get-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction Stop).Dhcp
+            if ($dhcpState -eq 'Disabled') {
+                $addr = Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                        Where-Object { $_.IPAddress -ne '127.0.0.1' } | Select-Object -First 1
+                if ($addr) {
+                    $entry.mode = 'static'
+                    $entry.ip   = [string]$addr.IPAddress
+                    $entry.mask = ConvertFrom-PrefixToMask $addr.PrefixLength
+                }
+            }
+        } catch { }
+
+        $gateways = @(Get-NetRoute -InterfaceIndex $index -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                      ForEach-Object { $_.NextHop })
+        $dns = @(Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                 ForEach-Object { $_.ServerAddresses } | Select-Object -Unique)
+
+        $entry.gateways = [object[]]$gateways
+        $entry.dns      = [object[]]$dns
+        $entry.dhcpDns  = ($dns.Count -eq 0)
+
+        $adapters += $entry
+    }
+
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    return [pscustomobject][ordered]@{
+        version   = 1
+        updatedAt = $stamp
+        profiles  = @(
+            [pscustomobject][ordered]@{
+                name     = "自动备份 $stamp"
+                remark   = '切换配置集之前自动保存的当前网络状态，可通过「备份记录」导入后切回'
+                adapters = [object[]]$adapters
+            }
+        )
+    }
+}
+
+# 写出备份文件并裁剪旧备份；任何失败都只记日志，绝不影响切换流程
+function Save-NetworkBackup {
+    try {
+        $dir = Get-BackupDirectory
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+        $data = Get-CurrentNetworkProfile
+        $file = Join-Path $dir ("NetSwitch-backup-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $json = $data | ConvertTo-Json -Depth 12
+        [System.IO.File]::WriteAllText($file, $json, (New-Object System.Text.UTF8Encoding($true)))
+
+        $existing = @(Get-BackupFiles)
+        if ($existing.Count -gt $script:BackupKeepCount) {
+            $existing | Select-Object -Skip $script:BackupKeepCount | ForEach-Object {
+                try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+
+        Write-NSLog "已自动备份当前网络状态：$file" 'OK'
+        return $file
+    } catch {
+        Write-NSLog "自动备份失败（不影响本次切换）：$($_.Exception.Message)" 'WARN'
+        return ''
+    }
+}
+
+# 把备份文件里的配置集合并进当前配置（重名自动加后缀），返回新增条数
+function Import-BackupAsProfiles {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { throw '备份文件不存在。' }
+
+    $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    if ($raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF) { $raw = $raw.Substring(1) }
+    $data = Repair-ConfigData ($raw | ConvertFrom-Json)
+
+    $list = [System.Collections.ArrayList]@(ConvertTo-Array $script:ConfigData.profiles)
+    $taken = @{}
+    foreach ($p in $list) { if ($null -ne $p -and $p.name) { $taken[[string]$p.name] = $true } }
+
+    $added = 0
+    foreach ($item in (ConvertTo-Array $data.profiles)) {
+        if ($null -eq $item -or [string]::IsNullOrWhiteSpace($item.name)) { continue }
+        $baseName = [string]$item.name
+        $name = $baseName
+        $n = 1
+        while ($taken.ContainsKey($name)) { $n++; $name = "$baseName ($n)" }
+        $taken[$name] = $true
+        $item.name = $name
+        [void]$list.Add($item)
+        $added++
+    }
+
+    if ($added -gt 0) {
+        $script:ConfigData.profiles = [object[]]$list
+        Save-ConfigFile | Out-Null
+    }
+    return $added
+}
+
 # ============================== 网络参数解析 ==============================
 
 function ConvertTo-PrefixLength {
@@ -608,6 +749,9 @@ function Invoke-Profile {
         Write-NSLog '当前没有管理员权限，无法修改网络配置。请以管理员身份运行。' 'ERROR'
         return $false
     }
+
+    # 切换会先清空网卡现有地址，所以动手之前先把当前网络状态备份下来
+    Save-NetworkBackup | Out-Null
 
     $failed = 0
     $processed = 0
@@ -1131,6 +1275,101 @@ function Show-ProfileEditor {
     return $null
 }
 
+# ---------- 备份记录 ----------
+
+function Show-BackupManager {
+
+    $dir = Get-BackupDirectory
+    $script:BackupManagerChanged = $false
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = '备份记录（切换配置集前自动保存）'
+    $form.Size = New-Object System.Drawing.Size(620, 452)
+    $form.StartPosition = 'CenterParent'
+    $form.MinimizeBox = $false
+    $form.MaximizeBox = $false
+    $form.Font = New-FormFont 9
+
+    $lblDir = New-Object System.Windows.Forms.Label
+    $lblDir.Text = "备份目录：$dir"
+    $lblDir.Location = New-Object System.Drawing.Point(14, 12)
+    $lblDir.Size = New-Object System.Drawing.Size(580, 20)
+    $lblDir.ForeColor = [System.Drawing.Color]::DimGray
+
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Location = New-Object System.Drawing.Point(14, 40)
+    $list.Size = New-Object System.Drawing.Size(580, 250)
+    $list.Font = New-MonoFont 9
+    $list.BorderStyle = 'FixedSingle'
+
+    $files = @(Get-BackupFiles)
+    foreach ($item in $files) { [void]$list.Items.Add($item.Name) }
+    if ($list.Items.Count -gt 0) { $list.SelectedIndex = 0 }
+
+    $lblTip = New-Object System.Windows.Forms.Label
+    $lblTip.Text = '每次点「应用此配置集」之前，程序都会把当时的网络参数存成一条备份。' + "`n" +
+                  '选中一条点「导入为配置集」，它就会出现在左侧列表里，再对它点「应用此配置集」即可切回当时的状态。'
+    $lblTip.Location = New-Object System.Drawing.Point(14, 298)
+    $lblTip.Size = New-Object System.Drawing.Size(580, 44)
+    $lblTip.ForeColor = [System.Drawing.Color]::FromArgb(60, 72, 90)
+
+    $btnRestore = New-Object System.Windows.Forms.Button
+    $btnRestore.Text = '导入为配置集'
+    $btnRestore.Location = New-Object System.Drawing.Point(14, 356)
+    $btnRestore.Size = New-Object System.Drawing.Size(140, 36)
+    $btnRestore.FlatStyle = 'Flat'
+    $btnRestore.BackColor = [System.Drawing.Color]::FromArgb(40, 150, 110)
+    $btnRestore.ForeColor = [System.Drawing.Color]::White
+
+    $btnOpenDir = New-Object System.Windows.Forms.Button
+    $btnOpenDir.Text = '打开备份目录'
+    $btnOpenDir.Location = New-Object System.Drawing.Point(164, 356)
+    $btnOpenDir.Size = New-Object System.Drawing.Size(140, 36)
+    $btnOpenDir.FlatStyle = 'Flat'
+    $btnOpenDir.BackColor = [System.Drawing.Color]::FromArgb(110, 122, 140)
+    $btnOpenDir.ForeColor = [System.Drawing.Color]::White
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = '关闭'
+    $btnClose.Location = New-Object System.Drawing.Point(454, 356)
+    $btnClose.Size = New-Object System.Drawing.Size(140, 36)
+    $btnClose.FlatStyle = 'Flat'
+
+    $btnRestore.Add_Click({
+        if ($list.SelectedIndex -lt 0) {
+            [System.Windows.Forms.MessageBox]::Show('请先选择一条备份记录。', '提示', 'OK', 'Information') | Out-Null
+            return
+        }
+        $file = $files[$list.SelectedIndex].FullName
+        try {
+            $count = Import-BackupAsProfiles -Path $file
+            $script:BackupManagerChanged = $true
+            Write-NSLog "已从备份导入 $count 个配置集：$file" 'OK'
+            [System.Windows.Forms.MessageBox]::Show(
+                "已导入 $count 个配置集。回到主界面选中它，点「应用此配置集」即可切回当时的网络状态。",
+                '导入完成', 'OK', 'Information') | Out-Null
+            $form.Close()
+        } catch {
+            Write-NSLog "备份导入失败：$($_.Exception.Message)" 'ERROR'
+            [System.Windows.Forms.MessageBox]::Show("导入失败：$($_.Exception.Message)", '错误', 'OK', 'Error') | Out-Null
+        }
+    })
+
+    $btnOpenDir.Add_Click({
+        try {
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            Start-Process explorer.exe -ArgumentList "`"$dir`"" -ErrorAction SilentlyContinue
+        } catch { }
+    })
+
+    $btnClose.Add_Click({ $form.Close() })
+
+    $form.Controls.AddRange(@($lblDir, $list, $lblTip, $btnRestore, $btnOpenDir, $btnClose))
+    [void]$form.ShowDialog()
+
+    return $script:BackupManagerChanged
+}
+
 # ---------- 主界面 ----------
 
 function Show-MainForm {
@@ -1307,7 +1546,7 @@ function Show-MainForm {
     $btnApply = New-Object System.Windows.Forms.Button
     $btnApply.Text = '应用此配置集'
     $btnApply.Location = New-Object System.Drawing.Point(0, 6)
-    $btnApply.Size = New-Object System.Drawing.Size(170, 36)
+    $btnApply.Size = New-Object System.Drawing.Size(160, 36)
     $btnApply.BackColor = [System.Drawing.Color]::SeaGreen
     $btnApply.ForeColor = [System.Drawing.Color]::White
     $btnApply.FlatStyle = 'Flat'
@@ -1315,46 +1554,54 @@ function Show-MainForm {
 
     $btnShortcut = New-Object System.Windows.Forms.Button
     $btnShortcut.Text = '生成桌面快捷方式'
-    $btnShortcut.Location = New-Object System.Drawing.Point(180, 6)
-    $btnShortcut.Size = New-Object System.Drawing.Size(160, 36)
+    $btnShortcut.Location = New-Object System.Drawing.Point(166, 6)
+    $btnShortcut.Size = New-Object System.Drawing.Size(156, 36)
     $btnShortcut.FlatStyle = 'Flat'
     $btnShortcut.BackColor = [System.Drawing.Color]::FromArgb(70, 130, 180)
     $btnShortcut.ForeColor = [System.Drawing.Color]::White
 
     $btnRefresh = New-Object System.Windows.Forms.Button
     $btnRefresh.Text = '刷新状态'
-    $btnRefresh.Location = New-Object System.Drawing.Point(350, 6)
-    $btnRefresh.Size = New-Object System.Drawing.Size(120, 36)
+    $btnRefresh.Location = New-Object System.Drawing.Point(328, 6)
+    $btnRefresh.Size = New-Object System.Drawing.Size(104, 36)
     $btnRefresh.FlatStyle = 'Flat'
     $btnRefresh.BackColor = $gray
     $btnRefresh.ForeColor = [System.Drawing.Color]::White
 
+    $btnBackup = New-Object System.Windows.Forms.Button
+    $btnBackup.Text = '备份记录'
+    $btnBackup.Location = New-Object System.Drawing.Point(438, 6)
+    $btnBackup.Size = New-Object System.Drawing.Size(112, 36)
+    $btnBackup.FlatStyle = 'Flat'
+    $btnBackup.BackColor = [System.Drawing.Color]::FromArgb(150, 112, 50)
+    $btnBackup.ForeColor = [System.Drawing.Color]::White
+
     $btnExport = New-Object System.Windows.Forms.Button
     $btnExport.Text = '导出配置'
-    $btnExport.Location = New-Object System.Drawing.Point(480, 6)
-    $btnExport.Size = New-Object System.Drawing.Size(120, 36)
+    $btnExport.Location = New-Object System.Drawing.Point(556, 6)
+    $btnExport.Size = New-Object System.Drawing.Size(104, 36)
     $btnExport.FlatStyle = 'Flat'
     $btnExport.BackColor = $gray
     $btnExport.ForeColor = [System.Drawing.Color]::White
 
     $btnOpenFile = New-Object System.Windows.Forms.Button
     $btnOpenFile.Text = '打开配置文件'
-    $btnOpenFile.Location = New-Object System.Drawing.Point(610, 6)
-    $btnOpenFile.Size = New-Object System.Drawing.Size(130, 36)
+    $btnOpenFile.Location = New-Object System.Drawing.Point(666, 6)
+    $btnOpenFile.Size = New-Object System.Drawing.Size(118, 36)
     $btnOpenFile.FlatStyle = 'Flat'
     $btnOpenFile.BackColor = $gray
     $btnOpenFile.ForeColor = [System.Drawing.Color]::White
 
     $btnCopyLog = New-Object System.Windows.Forms.Button
     $btnCopyLog.Text = '复制日志'
-    $btnCopyLog.Location = New-Object System.Drawing.Point(750, 6)
-    $btnCopyLog.Size = New-Object System.Drawing.Size(116, 36)
+    $btnCopyLog.Location = New-Object System.Drawing.Point(790, 6)
+    $btnCopyLog.Size = New-Object System.Drawing.Size(76, 36)
     $btnCopyLog.FlatStyle = 'Flat'
     $btnCopyLog.BackColor = [System.Drawing.Color]::FromArgb(90, 100, 120)
     $btnCopyLog.ForeColor = [System.Drawing.Color]::White
     $btnCopyLog.Anchor = 'Top, Right'
 
-    $action.Controls.AddRange(@($btnApply, $btnShortcut, $btnRefresh, $btnExport, $btnOpenFile, $btnCopyLog))
+    $action.Controls.AddRange(@($btnApply, $btnShortcut, $btnRefresh, $btnBackup, $btnExport, $btnOpenFile, $btnCopyLog))
 
     # 日志
     $grpLog = New-Object System.Windows.Forms.GroupBox
@@ -1544,6 +1791,10 @@ function Show-MainForm {
                 Write-NSLog "导入失败：$($_.Exception.Message)" 'ERROR'
             }
         }
+    })
+
+    $btnBackup.Add_Click({
+        if (Show-BackupManager) { & $reloadProfiles }
     })
 
     $btnExport.Add_Click({
