@@ -1204,7 +1204,8 @@ function Show-MainForm {
         $brush.Dispose()
         $font = New-FormFont 10
         $textBrush = New-Object System.Drawing.SolidBrush($foreColor)
-        $e.Graphics.DrawString($text, $font, $textBrush, (New-Object System.Drawing.RectangleF(10, $e.Bounds.Y + 4, $e.Bounds.Width - 10, 20)))
+        $textRect = New-Object System.Drawing.RectangleF(10, ($e.Bounds.Y + 4), ($e.Bounds.Width - 10), 20)
+        $e.Graphics.DrawString($text, $font, $textBrush, $textRect)
         $textBrush.Dispose()
         $font.Dispose()
         $e.DrawFocusRectangle()
