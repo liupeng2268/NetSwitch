@@ -951,32 +951,50 @@ function Show-ProfileEditor {
     $grid.MultiSelect = $false
     $grid.BackgroundColor = [System.Drawing.Color]::White
     $grid.BorderStyle = 'FixedSingle'
-    $grid.DataSource = $table
+
+    # 列必须显式创建：DataGridView 要等窗口显示、句柄建立之后才会按 DataSource 自动生成列，
+    # 在窗口构造阶段按列名读写（如 Columns['Mode']）会取到空值并抛未处理异常。
+    $grid.AutoGenerateColumns = $false
+
+    $colEnabled = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $colEnabled.Name = 'Enabled'; $colEnabled.DataPropertyName = 'Enabled'
+    $colEnabled.HeaderText = '启用'; $colEnabled.FillWeight = 22
+
+    $colAdapter = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colAdapter.Name = 'Adapter'; $colAdapter.DataPropertyName = 'Adapter'
+    $colAdapter.HeaderText = '网卡名称/匹配(支持*)'; $colAdapter.FillWeight = 58
 
     $colMode = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
-    $colMode.DataPropertyName = 'Mode'
-    $colMode.HeaderText = '获取方式'
+    $colMode.Name = 'Mode'; $colMode.DataPropertyName = 'Mode'
+    $colMode.HeaderText = '获取方式'; $colMode.FillWeight = 40
     [void]$colMode.Items.Add('静态IP')
     [void]$colMode.Items.Add('DHCP自动')
-    $colMode.FillWeight = 40
-    $oldIndex = $grid.Columns['Mode'].Index
-    $grid.Columns.Remove('Mode')
-    $grid.Columns.Insert($oldIndex, $colMode)
 
-    $grid.Columns['Enabled'].HeaderText  = '启用'
-    $grid.Columns['Enabled'].FillWeight  = 22
-    $grid.Columns['Adapter'].HeaderText  = '网卡名称/匹配(支持*)'
-    $grid.Columns['Adapter'].FillWeight  = 58
-    $grid.Columns['IP'].HeaderText       = 'IP 地址'
-    $grid.Columns['IP'].FillWeight       = 46
-    $grid.Columns['Mask'].HeaderText     = '子网掩码'
-    $grid.Columns['Mask'].FillWeight     = 44
-    $grid.Columns['Gateways'].HeaderText = '网关[:跃点]'
-    $grid.Columns['Gateways'].FillWeight = 56
-    $grid.Columns['DNS'].HeaderText      = 'DNS 服务器'
-    $grid.Columns['DNS'].FillWeight      = 54
-    $grid.Columns['Routes'].HeaderText   = '附加路由(可选)'
-    $grid.Columns['Routes'].FillWeight   = 62
+    $colIp = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colIp.Name = 'IP'; $colIp.DataPropertyName = 'IP'
+    $colIp.HeaderText = 'IP 地址'; $colIp.FillWeight = 46
+
+    $colMask = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colMask.Name = 'Mask'; $colMask.DataPropertyName = 'Mask'
+    $colMask.HeaderText = '子网掩码'; $colMask.FillWeight = 44
+
+    $colGw = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colGw.Name = 'Gateways'; $colGw.DataPropertyName = 'Gateways'
+    $colGw.HeaderText = '网关[:跃点]'; $colGw.FillWeight = 56
+
+    $colDns = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colDns.Name = 'DNS'; $colDns.DataPropertyName = 'DNS'
+    $colDns.HeaderText = 'DNS 服务器'; $colDns.FillWeight = 54
+
+    $colRoutes = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colRoutes.Name = 'Routes'; $colRoutes.DataPropertyName = 'Routes'
+    $colRoutes.HeaderText = '附加路由(可选)'; $colRoutes.FillWeight = 62
+
+    foreach ($col in @($colEnabled, $colAdapter, $colMode, $colIp, $colMask, $colGw, $colDns, $colRoutes)) {
+        [void]$grid.Columns.Add($col)
+    }
+
+    $grid.DataSource = $table
 
     # 底部按钮
     $btnSave = New-Object System.Windows.Forms.Button
