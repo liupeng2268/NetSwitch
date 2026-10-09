@@ -1439,7 +1439,8 @@ function Show-MainForm {
 
     $btnElevate.Add_Click({
         Write-NSLog '正在请求管理员权限并重启程序…'
-        $null = Start-Elevated
+        # 新模式进程已拉起，本实例必须自行退出，否则会同时留下两个主窗口
+        if (Start-Elevated) { $form.Close() }
     })
 
     $script:EditAction = {
@@ -1594,7 +1595,10 @@ function Show-MainForm {
             $answer = [System.Windows.Forms.MessageBox]::Show(
                 "应用配置需要管理员权限。`n是否现在切换到管理员模式运行？",
                 '需要管理员权限', 'YesNo', 'Question')
-            if ($answer -eq 'Yes') { Start-Elevated | Out-Null; return }
+            if ($answer -eq 'Yes') {
+                if (Start-Elevated) { $form.Close() }
+                return
+            }
             Write-NSLog '未获得管理员权限，已取消应用。' 'WARN'
             return
         }
