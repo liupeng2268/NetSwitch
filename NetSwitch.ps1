@@ -1006,6 +1006,10 @@ function Show-ProfileEditor {
         [string[]]$AdapterNames
     )
 
+    # 本函数也可能被单独调用（不经过 Show-MainForm），这里自行确保 WinForms 已加载
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
     $form = New-Object System.Windows.Forms.Form
     $form.Text = if ($null -eq $SourceProfile) { '新建配置集' } else { "编辑配置集 - $($SourceProfile.name)" }
     $form.Size = New-Object System.Drawing.Size(1020, 620)
@@ -1050,8 +1054,9 @@ function Show-ProfileEditor {
     $btnRemoveRow.Text = '- 删除选中行'; $btnRemoveRow.Location = New-Object System.Drawing.Point(644, 48); $btnRemoveRow.Size = New-Object System.Drawing.Size(120, 28)
 
     $lblTip = New-Object System.Windows.Forms.Label
-    $lblTip.Text = '提示：网关可写为 192.168.1.1:10 指定跃点数，多个网关用分号隔开；DNS 多个用分号隔开；附加路由写法 10.0.0.0/8>网关'
-    $lblTip.Location = New-Object System.Drawing.Point(14, 82); $lblTip.Size = New-Object System.Drawing.Size(950, 20)
+    $lblTip.Text = "填写方式：在下方表格里双击单元格，直接输入 IP / 子网掩码 / 网关 / DNS；最左侧「启用」列打勾表示该行生效。`n" +
+                   '提示：网关可写为 192.168.1.1:10 指定跃点数，多个网关或 DNS 用分号隔开；附加路由写法 10.0.0.0/8>网关'
+    $lblTip.Location = New-Object System.Drawing.Point(14, 80); $lblTip.Size = New-Object System.Drawing.Size(950, 38)
     $lblTip.ForeColor = [System.Drawing.Color]::DimGray
 
     # 表格
@@ -1084,8 +1089,8 @@ function Show-ProfileEditor {
     }
 
     $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Location = New-Object System.Drawing.Point(14, 106)
-    $grid.Size = New-Object System.Drawing.Size(980, 400)
+    $grid.Location = New-Object System.Drawing.Point(14, 122)
+    $grid.Size = New-Object System.Drawing.Size(980, 384)
     $grid.Anchor = 'Top, Bottom, Left, Right'
     $grid.AllowUserToAddRows = $false
     $grid.AllowUserToDeleteRows = $false
@@ -1095,6 +1100,8 @@ function Show-ProfileEditor {
     $grid.MultiSelect = $false
     $grid.BackgroundColor = [System.Drawing.Color]::White
     $grid.BorderStyle = 'FixedSingle'
+    $grid.EditMode = 'EditOnEnter'          # 点进单元格即可直接输入，省一次双击
+    $grid.RowTemplate.Height = 28
 
     # 列必须显式创建：DataGridView 要等窗口显示、句柄建立之后才会按 DataSource 自动生成列，
     # 在窗口构造阶段按列名读写（如 Columns['Mode']）会取到空值并抛未处理异常。
@@ -1139,6 +1146,17 @@ function Show-ProfileEditor {
     }
 
     $grid.DataSource = $table
+
+    # 表格为空时盖一层提示，明确告诉用户「IP 要填在哪」，避免面对空白表格无从下手
+    $lblEmpty = New-Object System.Windows.Forms.Label
+    $lblEmpty.Text = "表格还是空的`n`n请点上方「+ 添加网卡行」加入一行，`n再双击单元格填写 IP / 掩码 / 网关 / DNS"
+    $lblEmpty.Location = New-Object System.Drawing.Point(24, 128)
+    $lblEmpty.Size = New-Object System.Drawing.Size(960, 130)
+    $lblEmpty.TextAlign = 'MiddleCenter'
+    $lblEmpty.Font = New-FormFont 11
+    $lblEmpty.ForeColor = [System.Drawing.Color]::FromArgb(120, 132, 148)
+    $lblEmpty.BackColor = [System.Drawing.Color]::White
+    $lblEmpty.Visible = $false
 
     # 底部按钮
     $btnSave = New-Object System.Windows.Forms.Button
@@ -1185,9 +1203,16 @@ function Show-ProfileEditor {
         $newRow['DNS']      = ''
         $newRow['Routes']   = ''
         [void]$table.Rows.Add($newRow)
+        & $updateEmptyHint
     }
 
     $btnAddRow.Add_Click($addFromCombo)
+
+    # 表格空/非空时切换提示层
+    $updateEmptyHint = {
+        $lblEmpty.Visible = ($table.Rows.Count -eq 0)
+        if ($lblEmpty.Visible) { $lblEmpty.BringToFront() }
+    }
 
     $btnAddWildcard.Add_Click({
         $newRow = $table.NewRow()
@@ -1200,12 +1225,14 @@ function Show-ProfileEditor {
         $newRow['DNS']      = ''
         $newRow['Routes']   = ''
         [void]$table.Rows.Add($newRow)
+        & $updateEmptyHint
     })
 
     $btnRemoveRow.Add_Click({
         if ($grid.CurrentRow -and -not $grid.CurrentRow.IsNewRow) {
             $grid.Rows.RemoveAt($grid.CurrentRow.Index)
         }
+        & $updateEmptyHint
     })
 
 
@@ -1266,8 +1293,15 @@ function Show-ProfileEditor {
     $form.Controls.AddRange(@(
         $lblName, $txtName, $lblRemark, $txtRemark,
         $lblPick, $cboAdapters, $btnAddRow, $btnAddWildcard, $btnRemoveRow, $lblTip,
-        $grid, $btnSave, $btnCancel
+        $grid, $lblEmpty, $btnSave, $btnCancel
     ))
+
+    $form.Add_Shown({
+        # 新建时先自动放一行，用户打开就能直接往格子里填 IP，不必再找入口
+        if ($null -eq $SourceProfile -and $table.Rows.Count -eq 0) { & $addFromCombo }
+        & $updateEmptyHint
+        if ($grid.Rows.Count -gt 0) { $grid.CurrentCell = $grid.Rows[0].Cells['IP'] }
+    })
 
     $script:EditorResult = $null
     $dialog = $form.ShowDialog()
@@ -1625,6 +1659,15 @@ function Show-MainForm {
 
     $script:LogBox = $txtLog
 
+    # 回填历史日志：程序启动快照早于本窗口创建，此时 LogBox 还是空的，
+    # 若不回填，用户打开界面会看到「操作日志」一片空白，误以为什么都没记录。
+    $backfill = Get-LogTail -Lines 300
+    if (-not [string]::IsNullOrWhiteSpace($backfill)) {
+        $txtLog.Text = $backfill
+        $txtLog.SelectionStart = $txtLog.TextLength
+        $txtLog.ScrollToCaret()
+    }
+
     # ===== 界面逻辑 =====
 
     $reloadProfiles = {
@@ -1677,6 +1720,8 @@ function Show-MainForm {
     & $refreshStatus
     & $updateAdminLabel
     & $updateDetail
+
+    Write-NSLog "界面已就绪：共 $(@($script:ConfigData.profiles).Count) 个配置集。新建/编辑后点「应用此配置集」即可切换网络。" 'OK'
 
     $lstProfiles.Add_SelectedIndexChanged($updateDetail)
 
