@@ -44,6 +44,13 @@ $script:LogFile    = ''
 $script:ConfigFile = ''
 $script:ConfigData = $null
 
+# 脚本参数快照：函数内部读不到脚本作用域的 $PSBoundParameters（那是函数自己的），
+# 提权重启时必须靠这份快照把 -Apply / -Silent / -ConfigPath 等原样带给新进程
+$script:ScriptArgs = @{}
+foreach ($scriptArgKey in $PSBoundParameters.Keys) {
+    $script:ScriptArgs[$scriptArgKey] = $PSBoundParameters[$scriptArgKey]
+}
+
 # ============================== 通用工具函数 ==============================
 
 # 把一行内容追加到日志文件，写失败也绝不影响主流程
@@ -173,13 +180,15 @@ function Test-IsAdmin {
 function Start-Elevated {
     param([string[]]$ForwardArgs = @())
 
-    if ($ForwardArgs.Count -eq 0) {
+    if ($null -eq $ForwardArgs -or $ForwardArgs.Count -eq 0) {
+        # 用脚本级参数快照，不能用 $PSBoundParameters —— 函数内那份只含本函数的参数，恒为空
         $ForwardArgs = @()
-        foreach ($key in $PSBoundParameters.Keys) {
+        foreach ($key in $script:ScriptArgs.Keys) {
             if ($key -eq 'Elevated') { continue }
+            $value = $script:ScriptArgs[$key]
             $ForwardArgs += "-$key"
-            $value = $PSBoundParameters[$key]
             if ($value -is [switch]) { continue }
+            if ([string]::IsNullOrWhiteSpace([string]$value)) { continue }
             $ForwardArgs += "`"$value`""
         }
         $ForwardArgs += '-Elevated'
@@ -727,12 +736,11 @@ function Invoke-Profile {
         [switch]$DryRun
     )
 
-    $target = $null
-    foreach ($item in (ConvertTo-Array $script:ConfigData.profiles)) {
-        if ($item.name -eq $ProfileName) { $target = $item; break }
-    }
+    $target = Get-ProfileByName $ProfileName
     if ($null -eq $target) {
-        Write-NSLog "找不到配置集「$ProfileName」" 'ERROR'
+        $names = Get-ProfileNameList
+        $hint = if ($names.Count -gt 0) { "现有配置集：" + ($names -join '、') } else { '当前没有任何配置集。' }
+        Write-NSLog "找不到配置集「$ProfileName」。（$hint）" 'ERROR'
         return $false
     }
 
@@ -783,6 +791,74 @@ function Invoke-Profile {
     } else {
         Write-NSLog "配置集「$($target.name)」完成，但有 $failed 项失败（共 $processed 块网卡）。" 'WARN'
         return $false
+    }
+}
+
+# 为指定配置集生成（或覆盖）桌面快捷方式：双击即以管理员身份直接切换
+function New-ProfileShortcut {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+
+    $shell    = New-Object -ComObject WScript.Shell
+    $desktop  = $shell.SpecialFolders('Desktop')
+    $safeName = ($Name -replace '[\\/:*?"<>|]', '_')
+    $linkPath = Join-Path $desktop "$($script:AppName)-$safeName.lnk"
+
+    $shortcut = $shell.CreateShortcut($linkPath)
+    $shortcut.TargetPath       = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+    # 必须带 -Silent：窗口是隐藏的，用户看不到也按不到「按任意键结束」，否则进程会一直挂着
+    $shortcut.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Apply `"$Name`" -Silent"
+    $shortcut.WorkingDirectory = $PSScriptRoot
+    $shortcut.Description      = "一键切换到 [$Name]"
+    $shortcut.IconLocation     = 'netshell.dll,18'
+    $shortcut.Save()
+
+    # 给 .lnk 打上「以管理员身份运行」标志位，双击直接提权，省掉二次确认
+    $bytes = [System.IO.File]::ReadAllBytes($linkPath)
+    $bytes[0x15] = ($bytes[0x15] -bor 0x20)
+    [System.IO.File]::WriteAllBytes($linkPath, $bytes)
+
+    return $linkPath
+}
+
+# 配置集改名后同步桌面快捷方式；否则旧快捷方式里的名称失配，双击只会报「找不到配置集」
+function Sync-ProfileShortcutOnRename {
+    param([string]$OldName, [string]$NewName)
+
+    if ([string]::IsNullOrWhiteSpace($OldName)) { return }
+    if ($OldName -eq $NewName) { return }
+
+    try {
+        $shell   = New-Object -ComObject WScript.Shell
+        $desktop = $shell.SpecialFolders('Desktop')
+        $oldSafe = ($OldName -replace '[\\/:*?"<>|]', '_')
+        $oldLink = Join-Path $desktop "$($script:AppName)-$oldSafe.lnk"
+        if (-not (Test-Path -LiteralPath $oldLink)) { return }
+
+        # 先按新名称生成，确认成功后再删旧链；避免中途失败反而把可用的快捷方式弄丢
+        $newLink = New-ProfileShortcut -Name $NewName
+        if (Test-Path -LiteralPath $oldLink) { Remove-Item -LiteralPath $oldLink -Force }
+        Write-NSLog "配置集已改名，桌面快捷方式同步更新为「$(Split-Path $newLink -Leaf)」" 'OK'
+    } catch {
+        Write-NSLog "同步桌面快捷方式失败：$($_.Exception.Message)" 'WARN'
+    }
+}
+
+# 命令行模式下的可见反馈：桌面快捷方式用 -WindowStyle Hidden 启动，
+# 控制台文字用户根本看不到，出错时必须弹窗，否则用户只会觉得「双击没反应」
+function Show-CliMessageBox {
+    param(
+        [string]$Message,
+        [string]$Title = 'NetSwitch',
+        [string]$Icon  = 'Information'
+    )
+
+    try {
+        [void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')
+        [System.Windows.Forms.MessageBox]::Show($Message, $Title, 'OK', $Icon) | Out-Null
+    } catch {
+        # 弹窗失败不影响主流程，日志里已经记录了原因
     }
 }
 
@@ -901,17 +977,36 @@ function Invoke-Cli {
                 if (Start-Elevated) { return }
             }
             Write-Host '未获得管理员权限，操作取消。' -ForegroundColor Red
+            Show-CliMessageBox -Message '未能获得管理员权限，网络配置没有做任何改动。' -Title 'NetSwitch - 操作取消' -Icon 'Error'
             exit 1
         }
 
-        $result = Invoke-Profile -ProfileName $Apply
+        # 桌面快捷方式把名称写死在参数里，改了名就会失配；先解析，失败时把可选名称列出来
+        $actualName = Resolve-ProfileName $Apply
+        if ($null -eq $actualName) {
+            $names = Get-ProfileNameList
+            $body  = if ($names.Count -gt 0) { $names -join "`n  " } else { '（当前没有任何配置集）' }
+            $msg   = "找不到配置集：「$Apply」`n`n当前可用的配置集：`n  $body`n`n如果刚给配置集改过名字，回主界面点「快捷方式」重新生成一个即可。"
+            Write-NSLog "找不到配置集「$Apply」" 'ERROR'
+            Write-Host $msg -ForegroundColor Red
+            Show-CliMessageBox -Message $msg -Title 'NetSwitch - 找不到配置集' -Icon 'Warning'
+            exit 1
+        }
+
+        $result = Invoke-Profile -ProfileName $actualName
+        if (-not $result) {
+            $msg = "配置集「$actualName」没有切换成功，网络可能未按预期生效。`n`n日志文件：$($script:LogFile)"
+            Write-Host $msg -ForegroundColor Red
+            Show-CliMessageBox -Message $msg -Title 'NetSwitch - 切换未完成' -Icon 'Warning'
+            exit 1
+        }
+
         Write-Host "`n切换后的网络状态：`n" -ForegroundColor Cyan
         Write-Host (Get-StatusText)
         if (-not $Silent) {
             Write-Host '按任意键结束…' -ForegroundColor DarkGray
-            [void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            try { [void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
         }
-        if (-not $result) { exit 1 }
         return
     }
 
@@ -946,10 +1041,36 @@ function New-MonoFont {
     return (New-Object System.Drawing.Font('Consolas', $Size))
 }
 
+# 在配置集里按名称定位，容忍首尾空格与大小写差异，返回真实名称（找不到返回 $null）
+# 桌面快捷方式把名称写死在参数里，手工改名后只要差一个空格或一个字母就会失配
+function Resolve-ProfileName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $want  = $Name.Trim()
+    $items = @(ConvertTo-Array $script:ConfigData.profiles)
+
+    foreach ($item in $items) { if ([string]$item.name -ceq $want) { return [string]$item.name } }
+    foreach ($item in $items) { if (([string]$item.name).Trim() -ceq $want) { return [string]$item.name } }
+    foreach ($item in $items) {
+        if (([string]$item.name).Trim().ToLowerInvariant() -eq $want.ToLowerInvariant()) { return [string]$item.name }
+    }
+    return $null
+}
+
+# 列出全部配置集名称，用于「找不到配置集」时告诉用户可选范围
+function Get-ProfileNameList {
+    $names = @()
+    foreach ($item in (ConvertTo-Array $script:ConfigData.profiles)) { $names += [string]$item.name }
+    return @($names)
+}
+
 function Get-ProfileByName {
     param([string]$Name)
+    $resolved = Resolve-ProfileName $Name
+    if ($null -eq $resolved) { return $null }
     foreach ($item in (ConvertTo-Array $script:ConfigData.profiles)) {
-        if ($item.name -eq $Name) { return $item }
+        if ($item.name -eq $resolved) { return $item }
     }
     return $null
 }
@@ -1755,6 +1876,11 @@ function Show-MainForm {
             Save-ConfigFile | Out-Null
             & $reloadProfiles $index
             Write-NSLog "配置集「$($edited.name)」已更新" 'OK'
+
+            # 改了名字，桌面快捷方式里的旧名称就失效了，顺手同步
+            if ($original.name -ne $edited.name) {
+                Sync-ProfileShortcutOnRename -OldName ([string]$original.name) -NewName ([string]$edited.name)
+            }
         }
     }
 
@@ -1916,23 +2042,7 @@ function Show-MainForm {
         if ($lstProfiles.SelectedIndex -lt 0) { return }
         $name = [string]$lstProfiles.SelectedItem
         try {
-            $shell = New-Object -ComObject WScript.Shell
-            $desktop = $shell.SpecialFolders('Desktop')
-            $safeName = ($name -replace '[\\/:*?"<>|]', '_')
-            $linkPath = Join-Path $desktop "NetSwitch-$safeName.lnk"
-            $shortcut = $shell.CreateShortcut($linkPath)
-            $shortcut.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-            $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Apply `"$name`""
-            $shortcut.WorkingDirectory = $PSScriptRoot
-            $shortcut.Description = "一键切换到 [$name]"
-            $shortcut.IconLocation = 'netshell.dll,18'
-            $shortcut.Save()
-
-            # 让快捷方式以管理员身份启动
-            $bytes = [System.IO.File]::ReadAllBytes($linkPath)
-            $bytes[0x15] = ($bytes[0x15] -bor 0x20)
-            [System.IO.File]::WriteAllBytes($linkPath, $bytes)
-
+            $linkPath = New-ProfileShortcut -Name $name
             Write-NSLog "桌面快捷方式已创建：$linkPath（双击即可切换到「$name」）" 'OK'
         } catch {
             Write-NSLog "创建快捷方式失败：$($_.Exception.Message)" 'ERROR'
