@@ -1598,6 +1598,363 @@ function New-MonoFont {
     return (New-Object System.Drawing.Font('Consolas', $Size))
 }
 
+# ============================== Win11 风格主题 ==============================
+# 目标：不引入任何第三方组件、不新增外部资源文件，纯代码把界面换成 Windows 11 观感。
+# 做法：按钮 / 卡片全部用 GDI+ 自绘（GraphicsPath + AntiAlias），再由 Invoke-UiTheme
+#       递归统一套用 —— 改动集中在主题层，各处布局坐标一行不动。
+#
+# 两个必须记住的 WinForms 细节：
+#   1) Paint 事件在控件自身文字绘制「之后」触发，自绘的背景会盖掉按钮文字，
+#      因此必须在 Paint 里自己 DrawString 重画文字。
+#   2) DrawString 必须显式构造 RectangleF，否则 PowerShell 会选中 PointF 重载而报错。
+
+# 配色表必须延迟初始化：脚本顶层执行时 System.Drawing 往往还没加载，
+# 直接在上面写 [System.Drawing.Color]::FromArgb 会因找不到类型而静默失败，
+# 结果是 $script:UiTheme 为 $null、后面每次取色都拿到空值。
+$script:UiTheme = $null
+
+function Initialize-UiTheme {
+    if ($null -ne $script:UiTheme) { return }
+    Add-Type -AssemblyName System.Drawing
+
+    $script:UiTheme = @{
+    Bg         = [System.Drawing.Color]::FromArgb(243, 243, 243)  # 窗口底色
+    Card       = [System.Drawing.Color]::White                    # 卡片
+    Border     = [System.Drawing.Color]::FromArgb(229, 229, 229)  # 卡片描边
+    Text       = [System.Drawing.Color]::FromArgb(26, 26, 26)     # 正文
+    TextMuted  = [System.Drawing.Color]::FromArgb(96, 96, 96)     # 次要文字
+    Accent     = [System.Drawing.Color]::FromArgb(0, 103, 192)    # Win11 强调色
+    AccentHot  = [System.Drawing.Color]::FromArgb(25, 118, 200)
+    AccentDown = [System.Drawing.Color]::FromArgb(0, 84, 158)
+    AccentSoft = [System.Drawing.Color]::FromArgb(232, 240, 250)  # 选中项浅强调色
+    Danger     = [System.Drawing.Color]::FromArgb(196, 43, 28)
+    DangerHot  = [System.Drawing.Color]::FromArgb(253, 242, 240)
+    Hover      = [System.Drawing.Color]::FromArgb(246, 246, 246)
+    Pressed    = [System.Drawing.Color]::FromArgb(237, 237, 237)
+    LogBg      = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    }
+}
+
+# 取主题色。所有用到配色的地方都走这个函数，保证不论从哪个入口（主界面/编辑器/备份）
+# 进来，System.Drawing 与色表都已就绪。
+function Get-UiColor {
+    param([string]$Key)
+    Initialize-UiTheme
+    if ($script:UiTheme.ContainsKey($Key)) { return $script:UiTheme[$Key] }
+    return [System.Drawing.Color]::Black
+}
+
+# 要整张色表（自绘时一次取多种颜色，逐次调 Get-UiColor 反而绕）
+function Get-UiThemeMap {
+    Initialize-UiTheme
+    return $script:UiTheme
+}
+
+# 圆角矩形路径。半径给的是「圆角半径」，内部按直径 AddArc。
+function New-UiRoundPath {
+    param(
+        [System.Drawing.Rectangle]$Rect,
+        [int]$Radius = 4
+    )
+    $d = $Radius * 2
+    # 半径不能超过短边的一半，否则弧会互相穿插画出畸形路径
+    if ($d -gt $Rect.Height) { $d = $Rect.Height }
+    if ($d -gt $Rect.Width) { $d = $Rect.Width }
+
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $path.AddArc($Rect.X, $Rect.Y, $d, $d, 180, 90)
+    $path.AddArc(($Rect.Right - $d), $Rect.Y, $d, $d, 270, 90)
+    $path.AddArc(($Rect.Right - $d), ($Rect.Bottom - $d), $d, $d, 0, 90)
+    $path.AddArc($Rect.X, ($Rect.Bottom - $d), $d, $d, 90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+# 把普通 Button 改造成 Win11 圆角按钮。
+# Role：Primary（实心强调色，主操作）/ Secondary（白底描边）/ Danger（红字，破坏性操作）
+function Set-UiButtonStyle {
+    param(
+        $Button,
+        [ValidateSet('Primary', 'Secondary', 'Danger')]
+        [string]$Role = 'Secondary',
+        [int]$Radius = 4
+    )
+
+    $t = Get-UiThemeMap
+    # 底色调成父容器的颜色：自绘只覆盖圆角以内，四角露出的一两像素要与父容器一致，
+    # 否则会看到方形的白角/黑角残留。
+    $base = $t.Bg
+    if ($null -ne $Button.Parent) { $base = $Button.Parent.BackColor }
+
+    $Button.FlatStyle = 'Flat'
+    $Button.FlatAppearance.BorderSize = 0
+    $Button.FlatAppearance.MouseOverBackColor = $base
+    $Button.FlatAppearance.MouseDownBackColor = $base
+    $Button.BackColor = $base
+    $Button.UseVisualStyleBackColor = $false
+    $Button.Cursor = 'Hand'
+    if ($Role -eq 'Primary') { $Button.Font = New-FormFont 9 Bold }
+
+    $Button.Tag = @{
+        Role   = $Role
+        Radius = $Radius
+        Hover  = $false
+        Down   = $false
+    }
+
+    $Button.Add_MouseEnter({ param($s, $e) $s.Tag['Hover'] = $true;  $s.Invalidate() })
+    $Button.Add_MouseLeave({ param($s, $e) $s.Tag['Hover'] = $false; $s.Tag['Down'] = $false; $s.Invalidate() })
+    $Button.Add_MouseDown({
+        param($s, $e)
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $s.Tag['Down'] = $true; $s.Invalidate() }
+    })
+    $Button.Add_MouseUp({ param($s, $e) $s.Tag['Down'] = $false; $s.Invalidate() })
+
+    $Button.Add_Paint({
+        param($s, $e)
+        $tag = $s.Tag
+        if ($null -eq $tag -or -not ($tag -is [hashtable]) -or -not $tag.ContainsKey('Role')) { return }
+
+        $th = Get-UiThemeMap
+        $g  = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+        $cr = $s.ClientRectangle
+        $rect = New-Object System.Drawing.Rectangle -ArgumentList @(($cr.X + 1), ($cr.Y + 1), ($cr.Width - 3), ($cr.Height - 3))
+        if ($rect.Width -le 4 -or $rect.Height -le 4) { return }
+
+        $path = New-UiRoundPath -Rect $rect -Radius ([int]$tag['Radius'])
+
+        $fill = $null
+        $line = $null
+        $fore = $th.Text
+        $hover = [bool]$tag['Hover']
+        $down  = [bool]$tag['Down']
+
+        switch ([string]$tag['Role']) {
+            'Primary' {
+                $fill = $th.Accent
+                if ($hover) { $fill = $th.AccentHot }
+                if ($down)  { $fill = $th.AccentDown }
+                $fore = [System.Drawing.Color]::White
+            }
+            'Danger' {
+                $fill = [System.Drawing.Color]::White
+                if ($hover) { $fill = $th.DangerHot }
+                if ($down)  { $fill = [System.Drawing.Color]::FromArgb(250, 231, 228) }
+                $line = $th.Border
+                $fore = $th.Danger
+            }
+            default {
+                $fill = [System.Drawing.Color]::White
+                if ($hover) { $fill = $th.Hover }
+                if ($down)  { $fill = $th.Pressed }
+                $line = $th.Border
+                $fore = $th.Text
+            }
+        }
+        if (-not $s.Enabled) { $fore = [System.Drawing.Color]::FromArgb(160, 160, 160) }
+
+        $brush = New-Object System.Drawing.SolidBrush $fill
+        $g.FillPath($brush, $path)
+        $brush.Dispose()
+        if ($null -ne $line) {
+            $pen = New-Object System.Drawing.Pen -ArgumentList @($line, 1)
+            $g.DrawPath($pen, $path)
+            $pen.Dispose()
+        }
+
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+        $sf = New-Object System.Drawing.StringFormat
+        $sf.Alignment = 'Center'
+        $sf.LineAlignment = 'Center'
+        $rf = New-Object System.Drawing.RectangleF -ArgumentList @([float]$rect.X, [float]$rect.Y, [float]$rect.Width, [float]$rect.Height)
+        $tb = New-Object System.Drawing.SolidBrush $fore
+        $g.DrawString($s.Text, $s.Font, $tb, $rf, $sf)
+        $tb.Dispose()
+        $sf.Dispose()
+        $path.Dispose()
+    })
+}
+
+# GroupBox 的方框 + 内嵌标题是典型的旧式外观，换成「圆角白卡片 + 卡内标题」。
+# 布局不变：卡片与原 GroupBox 同尺寸同锚点，子控件整体下移 10px、高度减 10px，
+# 底边距保持不变，所以底部对齐（Anchor=Bottom）的控件不会错位。
+function ConvertTo-UiCard {
+    param($GroupBox)
+
+    $t = Get-UiThemeMap
+    $parent = $GroupBox.Parent
+    if ($null -eq $parent) { return $GroupBox }
+
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Location = $GroupBox.Location
+    $card.Size     = $GroupBox.Size
+    $card.Anchor   = $GroupBox.Anchor
+    $card.BackColor = $t.Bg
+    $card.Tag = @{ Title = [string]$GroupBox.Text }
+
+    foreach ($child in @($GroupBox.Controls)) {
+        $GroupBox.Controls.Remove($child)
+        $child.Location = New-Object System.Drawing.Point -ArgumentList @($child.Location.X, ($child.Location.Y + 10))
+        $child.Size     = New-Object System.Drawing.Size  -ArgumentList @($child.Size.Width, ($child.Size.Height - 10))
+        $card.Controls.Add($child)
+    }
+
+    $card.Add_Paint({
+        param($s, $e)
+        $tag = $s.Tag
+        # 必须先给默认值：PowerShell 下未赋值的变量在严格模式下取用会报错
+        $titleText = ''
+        if ($tag -is [hashtable] -and $tag.ContainsKey('Title')) { $titleText = [string]$tag['Title'] }
+
+        $th = Get-UiThemeMap
+        $g  = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+        $cr = $s.ClientRectangle
+        $rect = New-Object System.Drawing.Rectangle -ArgumentList @(($cr.X + 1), ($cr.Y + 1), ($cr.Width - 3), ($cr.Height - 3))
+        if ($rect.Width -le 8 -or $rect.Height -le 8) { return }
+
+        $path = New-UiRoundPath -Rect $rect -Radius 8
+        $brush = New-Object System.Drawing.SolidBrush $th.Card
+        $g.FillPath($brush, $path)
+        $brush.Dispose()
+        $pen = New-Object System.Drawing.Pen -ArgumentList @($th.Border, 1)
+        $g.DrawPath($pen, $path)
+        $pen.Dispose()
+
+        if ($titleText) {
+            $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+            $font = New-FormFont 10 Bold
+            $sf = New-Object System.Drawing.StringFormat
+            $sf.LineAlignment = 'Center'
+            $rf = New-Object System.Drawing.RectangleF -ArgumentList @(14.0, 5.0, [float]($rect.Width - 28), 22.0)
+            $tb = New-Object System.Drawing.SolidBrush $th.Text
+            $g.DrawString($titleText, $font, $tb, $rf, $sf)
+            $tb.Dispose()
+            $sf.Dispose()
+            $font.Dispose()
+        }
+        $path.Dispose()
+    })
+
+    $parent.Controls.Add($card)
+    $parent.Controls.Remove($GroupBox)
+    $GroupBox.Dispose()
+    return $card
+}
+
+# 递归套用主题。先处理容器（决定底色），再处理子控件。
+function Invoke-UiTheme {
+    param($Root)
+
+    $t = Get-UiThemeMap
+
+    if ($Root -is [System.Windows.Forms.Form]) {
+        $Root.BackColor = $t.Bg
+    }
+
+    foreach ($c in @($Root.Controls)) {
+
+        if ($c -is [System.Windows.Forms.GroupBox]) {
+            $card = ConvertTo-UiCard -GroupBox $c
+            Invoke-UiTheme -Root $card
+            continue
+        }
+
+        if ($c -is [System.Windows.Forms.Button]) {
+            # 调用方可以用 Tag 显式指定层级（推荐）；没指定时按原 BackColor 猜：
+            # 绿色（应用 / 保存 / 绑定）-> Primary，红色（删除）-> Danger，其余 -> Secondary
+            $role = 'Secondary'
+            if ($c.Tag -is [string] -and $c.Tag -in @('Primary', 'Secondary', 'Danger')) {
+                $role = [string]$c.Tag
+                $argb = -1
+            } else {
+                $argb = $c.BackColor.ToArgb()
+            }
+            if ($argb -eq [System.Drawing.Color]::SeaGreen.ToArgb() -or
+                $argb -eq [System.Drawing.Color]::FromArgb(40, 150, 110).ToArgb() -or
+                $argb -eq [System.Drawing.Color]::FromArgb(200, 130, 40).ToArgb()) {
+                $role = 'Primary'
+            } elseif ($argb -eq [System.Drawing.Color]::FromArgb(190, 80, 80).ToArgb()) {
+                $role = 'Danger'
+            }
+            Set-UiButtonStyle -Button $c -Role $role
+            continue
+        }
+
+        if ($c -is [System.Windows.Forms.RichTextBox]) {
+            $c.BackColor = $t.LogBg
+            $c.ForeColor = $t.Text
+            $c.BorderStyle = 'None'
+            continue
+        }
+
+        if ($c -is [System.Windows.Forms.TextBox]) {
+            $c.BackColor = $t.Card
+            $c.ForeColor = $t.Text
+            continue
+        }
+
+        if ($c -is [System.Windows.Forms.DataGridView]) {
+            $c.BackColor = $t.Card
+            $c.BackgroundColor = $t.Card
+            $c.GridColor = $t.Border
+            $c.EnableHeadersVisualStyles = $false
+            $c.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+            $c.ColumnHeadersDefaultCellStyle.ForeColor = $t.Text
+            $c.ColumnHeadersDefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+            $c.ColumnHeadersDefaultCellStyle.SelectionForeColor = $t.Text
+            $c.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 252)
+            $c.DefaultCellStyle.SelectionBackColor = $t.AccentSoft
+            $c.DefaultCellStyle.SelectionForeColor = $t.Text
+            continue
+        }
+
+        if ($c -is [System.Windows.Forms.Label]) {
+            # 只改默认黑色文字的标签；顶部标题那种显式设成白色的保持原样
+            if ($c.ForeColor.ToArgb() -eq [System.Drawing.Color]::Black.ToArgb()) { $c.ForeColor = $t.Text }
+            continue
+        }
+
+        if ($c -is [System.Windows.Forms.ListBox]) {
+            $c.ForeColor = $t.Text
+            $c.BackColor = $t.Card
+            # 默认的系统深蓝选中色与浅色主题冲突，换成强调色
+            if ($c.DrawMode -eq 'Normal') {
+                $c.DrawMode = 'OwnerDrawFixed'
+                $c.ItemHeight = [int]($c.Font.GetHeight() + 8)
+                $c.Add_DrawItem({
+                    param($sender, $e)
+                    if ($e.Index -lt 0) { return }
+                    $th = Get-UiThemeMap
+                    $selected = (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)
+                    $fill = $th.Card
+                    $fore = $th.Text
+                    if ($selected) { $fill = $th.AccentSoft; $fore = $th.Text }
+                    $b = New-Object System.Drawing.SolidBrush $fill
+                    $e.Graphics.FillRectangle($b, $e.Bounds)
+                    $b.Dispose()
+                    $tb = New-Object System.Drawing.SolidBrush $fore
+                    $rf = New-Object System.Drawing.RectangleF -ArgumentList @([float]($e.Bounds.X + 6), [float]$e.Bounds.Y, [float]($e.Bounds.Width - 8), [float]$e.Bounds.Height)
+                    $e.Graphics.DrawString([string]$sender.Items[$e.Index], $sender.Font, $tb, $rf)
+                    $tb.Dispose()
+                })
+            }
+            continue
+        }
+
+        if ($c -is [System.Windows.Forms.CheckBox]) {
+            $c.ForeColor = $t.TextMuted
+            $c.Cursor = 'Hand'
+            continue
+        }
+
+        if ($c.HasChildren) { Invoke-UiTheme -Root $c }
+    }
+}
+
 # 在配置集里按名称定位，容忍首尾空格与大小写差异，返回真实名称（找不到返回 $null）
 # 桌面快捷方式把名称写死在参数里，手工改名后只要差一个空格或一个字母就会失配
 function Resolve-ProfileName {
@@ -1884,6 +2241,9 @@ function Show-AdapterRebindDialog {
         })
 
         $form.Controls.AddRange(@($lblEntries, $lstEntries, $lblAdapters, $lstAdapters, $lblMode, $btnBind, $btnCancel))
+
+        $btnBind.Tag = 'Primary'
+        try { Invoke-UiTheme -Root $form } catch { }
 
         $result = $form.ShowDialog()
         return ($result -eq [System.Windows.Forms.DialogResult]::OK)
@@ -2207,6 +2567,12 @@ function Show-ProfileEditor {
         $grid, $lblEmpty, $btnSave, $btnCancel
     ))
 
+    $btnSave.Tag = 'Primary'
+    # 编辑器是固定坐标布局，套用卡片化会整体位移，这里只统一配色与按钮观感
+    try { Invoke-UiTheme -Root $form } catch { }
+    # 空表格提示层盖在表格上，套完主题要重新压到最上层
+    if ($lblEmpty.Visible) { $lblEmpty.BringToFront() }
+
     $form.Add_Shown({
         # 新建时先自动放一行，用户打开就能直接往格子里填 IP，不必再找入口
         if ($null -eq $SourceProfile -and $table.Rows.Count -eq 0) { & $addFromCombo }
@@ -2375,6 +2741,12 @@ function Show-BackupManager {
     $btnClose.Add_Click({ $form.Close() })
 
     $form.Controls.AddRange(@($lblDir, $list, $lblTip, $btnRestore, $btnOpenDir, $btnRestoreDirect, $btnClose))
+
+    $btnRestore.Tag = 'Primary'
+    # 「还原到网卡」会直接改写网络参数，风险高于「导入为配置集」，降为次级按钮避免两个主操作并列
+    $btnRestoreDirect.Tag = 'Secondary'
+    try { Invoke-UiTheme -Root $form } catch { }
+
     [void]$form.ShowDialog()
 
     return $script:BackupManagerChanged
@@ -2392,30 +2764,41 @@ function Show-MainForm {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "NetSwitch $script:Version  -  内网 IP / 网关 一键切换"
     $form.Size = New-Object System.Drawing.Size(1180, 760)
-    $form.MinimumSize = New-Object System.Drawing.Size(1020, 660)
+    # 最小尺寸不能随便给：右侧操作区 8 个按钮固定宽 866px（左侧面板 292 + 866 = 1158 客户区），
+    # 窗口再窄按钮就会互相重叠；高度低于 720 时下方日志卡片会被压扁到看不见。
+    # 旧值是 (1020,660)，实测缩到该尺寸确实会出现按钮溢出与日志卡片塌陷。
+    $form.MinimumSize = New-Object System.Drawing.Size(1180, 720)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-FormFont 9
+    $form.BackColor = Get-UiColor 'Bg'
 
     # ===== 顶部 =====
+    # Win11 风格：不再用深色横幅，改成与窗口同底的浅色区，靠一条细分隔线与内容区分开
     $header = New-Object System.Windows.Forms.Panel
     $header.Location = New-Object System.Drawing.Point(0, 0)
     $header.Size = New-Object System.Drawing.Size(1180, 70)
     $header.Dock = 'None'
     $header.Anchor = 'Top, Left, Right'
-    $header.BackColor = [System.Drawing.Color]::FromArgb(43, 54, 70)
+    $header.BackColor = Get-UiColor 'Bg'
+
+    $headerLine = New-Object System.Windows.Forms.Panel
+    $headerLine.Location = New-Object System.Drawing.Point(0, 69)
+    $headerLine.Size = New-Object System.Drawing.Size(1180, 1)
+    $headerLine.Anchor = 'Bottom, Left, Right'
+    $headerLine.BackColor = Get-UiColor 'Border'
 
     $lblTitle = New-Object System.Windows.Forms.Label
     $lblTitle.Text = 'NetSwitch  内网 IP / 网关 / DNS 切换器'
-    $lblTitle.ForeColor = [System.Drawing.Color]::White
+    $lblTitle.ForeColor = Get-UiColor 'Text'
     $lblTitle.Font = New-FormFont 15 Bold
-    $lblTitle.Location = New-Object System.Drawing.Point(20, 14)
+    $lblTitle.Location = New-Object System.Drawing.Point(20, 13)
     $lblTitle.Size = New-Object System.Drawing.Size(520, 30)
 
     $lblConfig = New-Object System.Windows.Forms.Label
     $lblConfig.Text = "配置文件：$($script:ConfigFile)"
-    $lblConfig.ForeColor = [System.Drawing.Color]::FromArgb(170, 180, 195)
+    $lblConfig.ForeColor = Get-UiColor 'TextMuted'
     $lblConfig.Font = New-FormFont 8
-    $lblConfig.Location = New-Object System.Drawing.Point(22, 46)
+    $lblConfig.Location = New-Object System.Drawing.Point(22, 45)
     $lblConfig.Size = New-Object System.Drawing.Size(620, 18)
 
     $lblAdmin = New-Object System.Windows.Forms.Label
@@ -2423,31 +2806,29 @@ function Show-MainForm {
     $lblAdmin.Size = New-Object System.Drawing.Size(300, 26)
     $lblAdmin.TextAlign = 'MiddleRight'
     $lblAdmin.Font = New-FormFont 9 Bold
-    $lblAdmin.ForeColor = [System.Drawing.Color]::White
+    $lblAdmin.ForeColor = Get-UiColor 'Text'
 
     $btnElevate = New-Object System.Windows.Forms.Button
-    $btnElevate.Location = New-Object System.Drawing.Point(1010, 18)
+    $btnElevate.Location = New-Object System.Drawing.Point(1010, 16)
     $btnElevate.Size = New-Object System.Drawing.Size(150, 34)
     $btnElevate.Anchor = 'Top, Right'
     $btnElevate.Text = '提权并重启'
-    $btnElevate.FlatStyle = 'Flat'
-    $btnElevate.BackColor = [System.Drawing.Color]::FromArgb(200, 130, 40)
-    $btnElevate.ForeColor = [System.Drawing.Color]::White
-    $btnElevate.Font = New-FormFont 9 Bold
+    $btnElevate.Tag = 'Primary'
     $btnElevate.Visible = $false
 
-    $header.Controls.AddRange(@($lblTitle, $lblConfig, $lblAdmin, $btnElevate))
+    $header.Controls.AddRange(@($lblTitle, $lblConfig, $lblAdmin, $btnElevate, $headerLine))
 
     # ===== 左侧 =====
     $side = New-Object System.Windows.Forms.Panel
     $side.Location = New-Object System.Drawing.Point(12, 82)
     $side.Size = New-Object System.Drawing.Size(268, 630)
     $side.Anchor = 'Top, Bottom, Left'
+    $side.BackColor = Get-UiColor 'Bg'
 
     $lblSide = New-Object System.Windows.Forms.Label
     $lblSide.Text = '配置集列表'; $lblSide.Location = New-Object System.Drawing.Point(2, 0); $lblSide.Size = New-Object System.Drawing.Size(200, 20)
     $lblSide.Font = New-FormFont 9 Bold
-    $lblSide.ForeColor = [System.Drawing.Color]::FromArgb(60, 72, 90)
+    $lblSide.ForeColor = Get-UiColor 'TextMuted'
 
     $lstProfiles = New-Object System.Windows.Forms.ListBox
     $lstProfiles.Location = New-Object System.Drawing.Point(2, 24)
@@ -2455,21 +2836,45 @@ function Show-MainForm {
     $lstProfiles.Anchor = 'Top, Bottom, Left, Right'
     $lstProfiles.Font = New-FormFont 10
     $lstProfiles.DrawMode = 'OwnerDrawFixed'
-    $lstProfiles.ItemHeight = 40
-    $lstProfiles.BorderStyle = 'FixedSingle'
+    $lstProfiles.ItemHeight = 44
+    $lstProfiles.BorderStyle = 'None'
+    $lstProfiles.BackColor = Get-UiColor 'Bg'
 
     $lstProfiles.Add_DrawItem({
         param($sender, $e)
         if ($e.Index -lt 0) { return }
-        $e.DrawBackground()
+        $theme = Get-UiThemeMap
         $text = [string]$lstProfiles.Items[$e.Index]
         $selected = (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)
-        $backColor = if ($selected) { [System.Drawing.Color]::FromArgb(52, 152, 219) } else { [System.Drawing.Color]::White }
-        $foreColor = if ($selected) { [System.Drawing.Color]::White } else { [System.Drawing.Color]::FromArgb(45, 55, 70) }
-        $subColor  = if ($selected) { [System.Drawing.Color]::FromArgb(214, 234, 250) } else { [System.Drawing.Color]::FromArgb(132, 142, 156) }
-        $brush = New-Object System.Drawing.SolidBrush($backColor)
-        $e.Graphics.FillRectangle($brush, $e.Bounds)
-        $brush.Dispose()
+
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+        # Win11 列表项：整行底色与窗口一致，选中态是「圆角浅色块 + 左侧强调色竖条」，
+        # 而不是旧式整块高饱和蓝填充。
+        $bgBrush = New-Object System.Drawing.SolidBrush $theme.Bg
+        $g.FillRectangle($bgBrush, $e.Bounds)
+        $bgBrush.Dispose()
+
+        $itemRect = New-Object System.Drawing.Rectangle -ArgumentList @(($e.Bounds.X + 2), ($e.Bounds.Y + 2), ($e.Bounds.Width - 6), ($e.Bounds.Height - 5))
+        if ($selected) {
+            $path = New-UiRoundPath -Rect $itemRect -Radius 4
+            $selBrush = New-Object System.Drawing.SolidBrush $theme.AccentSoft
+            $g.FillPath($selBrush, $path)
+            $selBrush.Dispose()
+            $path.Dispose()
+
+            $barRect = New-Object System.Drawing.Rectangle -ArgumentList @(($itemRect.X + 3), ($itemRect.Y + 9), 3, ($itemRect.Height - 18))
+            $barPath = New-UiRoundPath -Rect $barRect -Radius 1
+            $barBrush = New-Object System.Drawing.SolidBrush $theme.Accent
+            $g.FillPath($barBrush, $barPath)
+            $barBrush.Dispose()
+            $barPath.Dispose()
+        }
+
+        $foreColor = $theme.Text
+        $subColor  = $theme.TextMuted
+        if ($selected) { $subColor = [System.Drawing.Color]::FromArgb(64, 96, 132) }
 
         # 第二行灰色次要信息：取自该配置集首个网卡条目的 mode / ip
         $subText = ''
@@ -2480,45 +2885,39 @@ function Show-MainForm {
         $subFont = New-FormFont 8
         $textBrush = New-Object System.Drawing.SolidBrush($foreColor)
         $subBrush = New-Object System.Drawing.SolidBrush($subColor)
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
         # 注意：RectangleF 的每个参数都必须单独加括号，否则 PowerShell 会把逗号解析成
         # 数组构造运算符，进而触发 [System.Object[]] 的 op_Subtraction 异常。切勿去掉括号。
-        $textRect = New-Object System.Drawing.RectangleF(10, ($e.Bounds.Y + 3), ($e.Bounds.Width - 16), 18)
-        $subRect  = New-Object System.Drawing.RectangleF(10, ($e.Bounds.Y + 21), ($e.Bounds.Width - 16), 15)
-        $e.Graphics.DrawString($text, $font, $textBrush, $textRect)
-        if ($subText) { $e.Graphics.DrawString($subText, $subFont, $subBrush, $subRect) }
+        $textRect = New-Object System.Drawing.RectangleF(14, ($e.Bounds.Y + 5), ($e.Bounds.Width - 24), 18)
+        $subRect  = New-Object System.Drawing.RectangleF(14, ($e.Bounds.Y + 23), ($e.Bounds.Width - 24), 15)
+        $g.DrawString($text, $font, $textBrush, $textRect)
+        if ($subText) { $g.DrawString($subText, $subFont, $subBrush, $subRect) }
         $subBrush.Dispose()
         $textBrush.Dispose()
         $subFont.Dispose()
         $font.Dispose()
-        $e.DrawFocusRectangle()
     })
 
     $mkButton = {
-        param($Text, $X, $Y, $W, $H, $Color)
+        param($Text, $X, $Y, $W, $H, $Role)
         $button = New-Object System.Windows.Forms.Button
         $button.Text = $Text
         $button.Location = New-Object System.Drawing.Point($X, $Y)
         $button.Size = New-Object System.Drawing.Size($W, $H)
-        $button.FlatStyle = 'Flat'
         $button.Anchor = 'Bottom, Left'
-        $button.BackColor = $Color
-        $button.ForeColor = [System.Drawing.Color]::White
-        $button.Font = New-FormFont 9
+        $button.Tag = $Role
         return $button
     }
 
-    $gray  = [System.Drawing.Color]::FromArgb(110, 122, 140)
-    $blue  = [System.Drawing.Color]::FromArgb(52, 120, 190)
-    $green = [System.Drawing.Color]::FromArgb(40, 150, 110)
-    $red   = [System.Drawing.Color]::FromArgb(190, 80, 80)
-
-    $btnNew     = & $mkButton '新建'  2    432 62 30 $green
-    $btnCopy    = & $mkButton '复制'  70   432 62 30 $gray
-    $btnEdit    = & $mkButton '编辑'  138  432 62 30 $blue
-    $btnDelete  = & $mkButton '删除'  206  432 58 30 $red
-    $btnUp      = & $mkButton '上移'  2    468 62 30 $gray
-    $btnDown    = & $mkButton '下移'  70   468 62 30 $gray
-    $btnImport  = & $mkButton '导入配置' 138 468 126 30 $gray
+    # 按钮层级沿用 Win11 语义：每屏只有一个主操作（实心强调色），其余为白底描边，
+    # 破坏性操作（删除）用红字。原来 8 个按钮各用一种饱和色，视觉上分不出轻重。
+    $btnNew     = & $mkButton '新建'     2   436 62 32 'Primary'
+    $btnCopy    = & $mkButton '复制'     70  436 62 32 'Secondary'
+    $btnEdit    = & $mkButton '编辑'     138 436 62 32 'Secondary'
+    $btnDelete  = & $mkButton '删除'     206 436 58 32 'Danger'
+    $btnUp      = & $mkButton '上移'     2   474 62 32 'Secondary'
+    $btnDown    = & $mkButton '下移'     70  474 62 32 'Secondary'
+    $btnImport  = & $mkButton '导入配置' 138 474 126 32 'Secondary'
 
     # 虚拟网卡排除开关：默认不勾选（即排除 VMware / 蓝牙 / 环回 / 本地连接* 等网卡）。
     # 勾选后等价于把 $script:ExcludeVirtualAdapters 设为 $false，所有网卡都可能被匹配到。
@@ -2527,7 +2926,7 @@ function Show-MainForm {
     $chkIncludeVirtual.Location = New-Object System.Drawing.Point(2, 506)
     $chkIncludeVirtual.Size = New-Object System.Drawing.Size(258, 22)
     $chkIncludeVirtual.Anchor = 'Bottom, Left'
-    $chkIncludeVirtual.ForeColor = [System.Drawing.Color]::FromArgb(110, 122, 140)
+    $chkIncludeVirtual.ForeColor = Get-UiColor 'TextMuted'
     $chkIncludeVirtual.Checked = (-not $script:ExcludeVirtualAdapters)
 
     $side.Controls.AddRange(@($lblSide, $lstProfiles, $btnNew, $btnCopy, $btnEdit, $btnDelete, $btnUp, $btnDown, $btnImport, $chkIncludeVirtual))
@@ -2537,6 +2936,7 @@ function Show-MainForm {
     $right.Location = New-Object System.Drawing.Point(292, 82)
     $right.Size = New-Object System.Drawing.Size(870, 630)
     $right.Anchor = 'Top, Bottom, Left, Right'
+    $right.BackColor = Get-UiColor 'Bg'
 
     # 当前状态
     $grpStatus = New-Object System.Windows.Forms.GroupBox
@@ -2547,11 +2947,11 @@ function Show-MainForm {
     $txtStatus = New-Object System.Windows.Forms.TextBox
     $txtStatus.Multiline = $true; $txtStatus.ReadOnly = $true
     $txtStatus.ScrollBars = 'Vertical'
-    $txtStatus.Location = New-Object System.Drawing.Point(10, 22)
-    $txtStatus.Size = New-Object System.Drawing.Size(846, 196)
+    $txtStatus.Location = New-Object System.Drawing.Point(14, 30)
+    $txtStatus.Size = New-Object System.Drawing.Size(838, 184)
     $txtStatus.Anchor = 'Top, Bottom, Left, Right'
     $txtStatus.BorderStyle = 'None'
-    $txtStatus.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $txtStatus.BackColor = Get-UiColor 'LogBg'
     $txtStatus.Font = New-MonoFont 9
     $grpStatus.Controls.Add($txtStatus)
 
@@ -2560,15 +2960,21 @@ function Show-MainForm {
     $grpDetail.Text = '配置集内容'
     $grpDetail.Location = New-Object System.Drawing.Point(0, 234)
     $grpDetail.Size = New-Object System.Drawing.Size(866, 212)
-    $grpDetail.Anchor = 'Top, Left, Right'
+    # 右侧四块的锚点分工（窗口变矮时谁让出高度）：
+    #   状态卡片 固定高（内容要完整看得清）
+    #   详情卡片 Top+Bottom —— 唯一响应高度变化的一块，表格多一行少一行都不影响阅读
+    #   操作区   Bottom —— 钉在底部跟着日志走
+    #   日志卡片 Bottom 固定高 —— 不能被压扁，否则日志等于看不见
+    # 早先四块全是 Top 锚定，缩到最小尺寸时按钮行溢出、日志卡片塌陷成一条缝。
+    $grpDetail.Anchor = 'Top, Bottom, Left, Right'
     $txtDetail = New-Object System.Windows.Forms.TextBox
     $txtDetail.Multiline = $true; $txtDetail.ReadOnly = $true
     $txtDetail.ScrollBars = 'Vertical'
-    $txtDetail.Location = New-Object System.Drawing.Point(10, 22)
-    $txtDetail.Size = New-Object System.Drawing.Size(846, 182)
+    $txtDetail.Location = New-Object System.Drawing.Point(14, 30)
+    $txtDetail.Size = New-Object System.Drawing.Size(838, 170)
     $txtDetail.Anchor = 'Top, Bottom, Left, Right'
     $txtDetail.BorderStyle = 'None'
-    $txtDetail.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $txtDetail.BackColor = Get-UiColor 'LogBg'
     $txtDetail.Font = New-MonoFont 9
     $grpDetail.Controls.Add($txtDetail)
 
@@ -2576,75 +2982,59 @@ function Show-MainForm {
     $action = New-Object System.Windows.Forms.Panel
     $action.Location = New-Object System.Drawing.Point(0, 454)
     $action.Size = New-Object System.Drawing.Size(866, 46)
-    $action.Anchor = 'Top, Left, Right'
+    $action.Anchor = 'Bottom, Left, Right'
+    $action.BackColor = Get-UiColor 'Bg'
 
     # 操作区共 8 个按钮，容器宽 866px，相邻间隔统一 6px：
     # 宽度合计 = 866 - 7*6 = 824
     #   X: 0(128) 134(116) 256(136) 398(88) 492(92) 590(88) 684(104) 794(72) -> 右边缘 866
     $btnApply = New-Object System.Windows.Forms.Button
     $btnApply.Text = '应用此配置集'
-    $btnApply.Location = New-Object System.Drawing.Point(0, 6)
+    $btnApply.Location = New-Object System.Drawing.Point(0, 5)
     $btnApply.Size = New-Object System.Drawing.Size(128, 36)
-    $btnApply.BackColor = [System.Drawing.Color]::SeaGreen
-    $btnApply.ForeColor = [System.Drawing.Color]::White
-    $btnApply.FlatStyle = 'Flat'
-    $btnApply.Font = New-FormFont 10 Bold
+    $btnApply.Tag = 'Primary'
 
     $btnPreview = New-Object System.Windows.Forms.Button
     $btnPreview.Text = '预览此配置集'
-    $btnPreview.Location = New-Object System.Drawing.Point(134, 6)
+    $btnPreview.Location = New-Object System.Drawing.Point(134, 5)
     $btnPreview.Size = New-Object System.Drawing.Size(116, 36)
-    $btnPreview.FlatStyle = 'Flat'
-    $btnPreview.BackColor = [System.Drawing.Color]::FromArgb(90, 150, 190)
-    $btnPreview.ForeColor = [System.Drawing.Color]::White
+    $btnPreview.Tag = 'Secondary'
 
     $btnShortcut = New-Object System.Windows.Forms.Button
     $btnShortcut.Text = '生成桌面快捷方式'
-    $btnShortcut.Location = New-Object System.Drawing.Point(256, 6)
+    $btnShortcut.Location = New-Object System.Drawing.Point(256, 5)
     $btnShortcut.Size = New-Object System.Drawing.Size(136, 36)
-    $btnShortcut.FlatStyle = 'Flat'
-    $btnShortcut.BackColor = [System.Drawing.Color]::FromArgb(70, 130, 180)
-    $btnShortcut.ForeColor = [System.Drawing.Color]::White
+    $btnShortcut.Tag = 'Secondary'
 
     $btnRefresh = New-Object System.Windows.Forms.Button
     $btnRefresh.Text = '刷新状态'
-    $btnRefresh.Location = New-Object System.Drawing.Point(398, 6)
+    $btnRefresh.Location = New-Object System.Drawing.Point(398, 5)
     $btnRefresh.Size = New-Object System.Drawing.Size(88, 36)
-    $btnRefresh.FlatStyle = 'Flat'
-    $btnRefresh.BackColor = $gray
-    $btnRefresh.ForeColor = [System.Drawing.Color]::White
+    $btnRefresh.Tag = 'Secondary'
 
     $btnBackup = New-Object System.Windows.Forms.Button
     $btnBackup.Text = '备份记录'
-    $btnBackup.Location = New-Object System.Drawing.Point(492, 6)
+    $btnBackup.Location = New-Object System.Drawing.Point(492, 5)
     $btnBackup.Size = New-Object System.Drawing.Size(92, 36)
-    $btnBackup.FlatStyle = 'Flat'
-    $btnBackup.BackColor = [System.Drawing.Color]::FromArgb(150, 112, 50)
-    $btnBackup.ForeColor = [System.Drawing.Color]::White
+    $btnBackup.Tag = 'Secondary'
 
     $btnExport = New-Object System.Windows.Forms.Button
     $btnExport.Text = '导出配置'
-    $btnExport.Location = New-Object System.Drawing.Point(590, 6)
+    $btnExport.Location = New-Object System.Drawing.Point(590, 5)
     $btnExport.Size = New-Object System.Drawing.Size(88, 36)
-    $btnExport.FlatStyle = 'Flat'
-    $btnExport.BackColor = $gray
-    $btnExport.ForeColor = [System.Drawing.Color]::White
+    $btnExport.Tag = 'Secondary'
 
     $btnOpenFile = New-Object System.Windows.Forms.Button
     $btnOpenFile.Text = '打开配置文件'
-    $btnOpenFile.Location = New-Object System.Drawing.Point(684, 6)
+    $btnOpenFile.Location = New-Object System.Drawing.Point(684, 5)
     $btnOpenFile.Size = New-Object System.Drawing.Size(104, 36)
-    $btnOpenFile.FlatStyle = 'Flat'
-    $btnOpenFile.BackColor = $gray
-    $btnOpenFile.ForeColor = [System.Drawing.Color]::White
+    $btnOpenFile.Tag = 'Secondary'
 
     $btnCopyLog = New-Object System.Windows.Forms.Button
     $btnCopyLog.Text = '复制日志'
-    $btnCopyLog.Location = New-Object System.Drawing.Point(794, 6)
+    $btnCopyLog.Location = New-Object System.Drawing.Point(794, 5)
     $btnCopyLog.Size = New-Object System.Drawing.Size(72, 36)
-    $btnCopyLog.FlatStyle = 'Flat'
-    $btnCopyLog.BackColor = [System.Drawing.Color]::FromArgb(90, 100, 120)
-    $btnCopyLog.ForeColor = [System.Drawing.Color]::White
+    $btnCopyLog.Tag = 'Secondary'
     $btnCopyLog.Anchor = 'Top, Right'
 
     $action.Controls.AddRange(@($btnApply, $btnPreview, $btnShortcut, $btnRefresh, $btnBackup, $btnExport, $btnOpenFile, $btnCopyLog))
@@ -2654,15 +3044,15 @@ function Show-MainForm {
     $grpLog.Text = '操作日志'
     $grpLog.Location = New-Object System.Drawing.Point(0, 508)
     $grpLog.Size = New-Object System.Drawing.Size(866, 118)
-    $grpLog.Anchor = 'Top, Bottom, Left, Right'
+    $grpLog.Anchor = 'Bottom, Left, Right'
     $txtLog = New-Object System.Windows.Forms.RichTextBox
     $txtLog.Multiline = $true; $txtLog.ReadOnly = $true
-    $txtLog.Location = New-Object System.Drawing.Point(10, 22)
-    $txtLog.Size = New-Object System.Drawing.Size(846, 88)
+    $txtLog.Location = New-Object System.Drawing.Point(14, 30)
+    $txtLog.Size = New-Object System.Drawing.Size(838, 76)
     $txtLog.Anchor = 'Top, Bottom, Left, Right'
     $txtLog.BorderStyle = 'None'
-    $txtLog.BackColor = [System.Drawing.Color]::FromArgb(32, 36, 42)
-    $txtLog.ForeColor = [System.Drawing.Color]::FromArgb(220, 225, 232)
+    $txtLog.BackColor = Get-UiColor 'LogBg'
+    $txtLog.ForeColor = Get-UiColor 'Text'
     $txtLog.Font = New-MonoFont 9
     $grpLog.Controls.Add($txtLog)
 
@@ -2679,6 +3069,19 @@ function Show-MainForm {
         $txtLog.SelectionStart = $txtLog.TextLength
         $txtLog.ScrollToCaret()
     }
+
+    # 控件全部建好后再统一套用 Win11 主题：这样各处布局代码只关心坐标，
+    # 圆角/配色/层级集中在这一处，将来调整风格不必再逐个控件改。
+    # 主题失败不能让整个界面起不来，所以包一层 try。
+    try {
+        Invoke-UiTheme -Root $form
+    } catch {
+        Write-NSLog "界面主题应用失败（已回退为默认外观）：$($_.Exception.Message)" 'WARN'
+    }
+
+    # 日志框换成浅色底后，原来深色底上的浅灰字就看不见了，这里统一回正文色
+    $txtLog.ForeColor = Get-UiColor 'Text'
+    $txtLog.BackColor = Get-UiColor 'LogBg'
 
     # ===== 界面逻辑 =====
 
