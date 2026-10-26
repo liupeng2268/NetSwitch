@@ -51,6 +51,35 @@ foreach ($scriptArgKey in $PSBoundParameters.Keys) {
     $script:ScriptArgs[$scriptArgKey] = $PSBoundParameters[$scriptArgKey]
 }
 
+# ====================== 网卡安全过滤（防止误伤虚拟网卡） ======================
+# 背景：医院机器上通常同时存在 VMware / VirtualBox / Hyper-V 虚拟网卡、蓝牙网卡、
+# 环回适配器，以及手机热点共享出来的「本地连接*」。配置集里若把 adapter 写成 "*"，
+# 不加过滤就会把这些网卡一并刷成 DHCP，直接破坏虚拟机网络并踢掉无线。
+#
+# 【如何关闭】把下面这一行改成 $false 即可完全关闭过滤，恢复成「列出所有网卡」：
+$script:ExcludeVirtualAdapters = $true
+#
+# 图形界面里也有对应开关：主界面左下方「包含虚拟网卡（VMware/蓝牙等）」勾选框，
+# 勾选后等价于把本变量设为 $false（仅对当前进程有效，不写回脚本）。
+#
+# 【如何增减规则】直接改下面这个数组即可，匹配不区分大小写，
+# 同时按「网卡名称」和「网卡描述(InterfaceDescription)」做 -like 通配匹配。
+$script:VirtualAdapterPatterns = @(
+    '*VMware*',        # VMware Workstation 虚拟网卡
+    '*VMnet*',         # VMnet1 / VMnet8 等，名称里不含 VMware 的情况
+    '*VirtualBox*',    # VirtualBox Host-Only / Bridged
+    '*Hyper-V*',       # Hyper-V 虚拟交换机
+    '*HyperV*',
+    '*Bluetooth*',     # 蓝牙网络连接
+    '*蓝牙*',
+    '*Loopback*',      # 环回适配器
+    '*环回*',
+    '*本地连接*',      # 手机热点 / 网络共享产生的「本地连接* 」
+    '*Teredo*',        # IPv6 隧道伪接口
+    '*isatap*',
+    '*WAN Miniport*'   # 广域网微型端口，非真实物理网卡
+)
+
 # ============================== 通用工具函数 ==============================
 
 # 把一行内容追加到日志文件，写失败也绝不影响主流程
@@ -262,6 +291,7 @@ function New-DefaultData {
                 gateways = @()
                 dns      = @()
                 dhcpDns  = $true
+                defaultMetric = $null
                 routes   = @()
             }
         )
@@ -280,6 +310,7 @@ function New-DefaultData {
                 gateways = @('192.168.10.1')
                 dns      = @('192.168.10.1', '114.114.114.114')
                 dhcpDns  = $false
+                defaultMetric = $null
                 routes   = @()
             }
         )
@@ -319,6 +350,9 @@ function Repair-ConfigData {
             if (-not ($ad.PSObject.Properties.Name -contains 'ip'))       { $ad | Add-Member NoteProperty ip '' -Force }
             if (-not ($ad.PSObject.Properties.Name -contains 'mask'))     { $ad | Add-Member NoteProperty mask '' -Force }
             if (-not ($ad.PSObject.Properties.Name -contains 'dhcpDns'))  { $ad | Add-Member NoteProperty dhcpDns $true -Force }
+            # 兼容旧配置：没有 defaultMetric 字段的补 $null（= 交给系统自动分配）
+            if (-not ($ad.PSObject.Properties.Name -contains 'defaultMetric')) { $ad | Add-Member NoteProperty defaultMetric $null -Force }
+            $ad.defaultMetric = ConvertTo-MetricValue ([string]$ad.defaultMetric)
 
             $sortedGateways = ConvertTo-StringList $ad.gateways
             $sortedDns      = ConvertTo-StringList $ad.dns
@@ -371,6 +405,47 @@ function Import-ConfigFile {
     }
 }
 
+# profiles.json 自身备份的保留份数，超出的旧备份会被轮转删除
+$script:ConfigBackupKeepCount = 5
+
+# 把现有的配置文件复制一份（profiles.bak-yyyyMMdd-HHmmss.json）再让主流程覆盖写，
+# 写坏或误删时能回滚。任何失败都只记 WARN，绝不影响保存主流程
+function Backup-ConfigFile {
+    param([string]$Path = $script:ConfigFile)
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return }
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+
+        $directory = Split-Path -Parent $Path
+        if ([string]::IsNullOrWhiteSpace($directory)) { $directory = $PSScriptRoot }
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+
+        $target = Join-Path $directory ("{0}.bak-{1}.json" -f $stem, (Get-Date).ToString('yyyyMMdd-HHmmss'))
+        Copy-Item -LiteralPath $Path -Destination $target -Force -ErrorAction Stop
+
+        # 只清理本程序自己生成的 .bak-yyyyMMdd-HHmmss.json（严格匹配日期时间戳），
+        # 不使用宽泛通配符，避免误伤同目录里其他名字相近的文件
+        $pattern = '^{0}\.bak-\d{{8}}-\d{{6}}\.json$' -f [regex]::Escape($stem)
+        $existing = @(Get-ChildItem -LiteralPath $directory -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -match $pattern } |
+                      Sort-Object Name -Descending)
+        if ($existing.Count -gt $script:ConfigBackupKeepCount) {
+            $existing | Select-Object -Skip $script:ConfigBackupKeepCount | ForEach-Object {
+                try {
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                } catch {
+                    Write-NSLog "删除过期配置备份失败（$($_.FullName)）：$($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+
+        Write-NSLog "已备份现有配置到 $target" 'OK'
+    } catch {
+        Write-NSLog "备份现有配置失败（不影响本次保存）：$($_.Exception.Message)" 'WARN'
+    }
+}
+
 function Save-ConfigFile {
     param(
         [string]$Path = $script:ConfigFile,
@@ -383,6 +458,9 @@ function Save-ConfigFile {
     if ($directory -and -not (Test-Path $directory)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
+
+    # 覆盖写之前先给现有配置留一份备份，写坏时可直接回滚
+    Backup-ConfigFile -Path $Path
 
     $Data.updatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $json = $Data | ConvertTo-Json -Depth 12
@@ -532,6 +610,85 @@ function Import-BackupAsProfiles {
     return $added
 }
 
+# 读出备份文件，按当前机器的网卡做匹配，返回将要被改动的「网卡 + 参数」清单（用于还原前确认与执行）
+function Get-BackupRestoreTargets {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { throw '备份文件不存在。' }
+
+    $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    if ($raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF) { $raw = $raw.Substring(1) }
+    $data = Repair-ConfigData ($raw | ConvertFrom-Json)
+
+    $targets = @()
+    foreach ($profileItem in (ConvertTo-Array $data.profiles)) {
+        if ($null -eq $profileItem) { continue }
+        foreach ($config in (ConvertTo-Array $profileItem.adapters)) {
+            if ($null -eq $config) { continue }
+            if (-not $config.enabled) { continue }
+            foreach ($adapter in (Find-MatchedAdapters $config.adapter)) {
+                $targets += [pscustomobject]@{
+                    Profile = [string]$profileItem.name
+                    Adapter = $adapter
+                    Config  = $config
+                }
+            }
+        }
+    }
+    return @($targets)
+}
+
+# 把备份文件里的网络参数直接写回网卡（不用先导入成配置集），返回是否全部成功
+function Restore-BackupToAdapters {
+    param([string]$Path)
+
+    if (-not (Test-IsAdmin)) {
+        Write-NSLog '还原备份需要管理员权限，请以管理员身份运行本程序后再试。' 'ERROR'
+        return $false
+    }
+
+    $targets = @()
+    try {
+        $targets = @(Get-BackupRestoreTargets -Path $Path)
+    } catch {
+        Write-NSLog "读取备份失败：$($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    if ($targets.Count -eq 0) {
+        Write-NSLog '备份中没有匹配到本机现有的网卡，未做任何改动。' 'WARN'
+        return $false
+    }
+
+    Write-NSLog "开始还原备份：$Path" 'INFO'
+
+    # 还原同样会先清空网卡地址，动手之前先把当前状态再存一份，方便出错时回退
+    Save-NetworkBackup | Out-Null
+
+    $failed    = 0
+    $processed = 0
+
+    foreach ($target in $targets) {
+        $processed++
+        try {
+            Set-AdapterConfig -AdapterObject $target.Adapter -Config $target.Config
+        } catch {
+            $failed++
+            Write-NSLog "网卡「$($target.Adapter.Name)」还原失败：$($_.Exception.Message)" 'ERROR'
+        }
+    }
+
+    Start-Sleep -Milliseconds 500
+
+    if ($failed -eq 0) {
+        Write-NSLog "备份已还原到网卡（共处理 $processed 块网卡）" 'OK'
+        return $true
+    }
+
+    Write-NSLog "备份还原完成，但有 $failed 项失败（共 $processed 块网卡）。" 'WARN'
+    return $false
+}
+
 # ============================== 网络参数解析 ==============================
 
 function ConvertTo-PrefixLength {
@@ -612,13 +769,53 @@ function ConvertTo-RouteEntry {
     return @($result)
 }
 
+# 判断一块网卡是否属于「虚拟 / 非物理」网卡。
+# 关闭开关（$script:ExcludeVirtualAdapters = $false）时一律返回 $false，即不做任何排除。
+function Test-VirtualAdapter {
+    param($Adapter)
+
+    if ($null -eq $Adapter) { return $false }
+    if (-not $script:ExcludeVirtualAdapters) { return $false }
+
+    $name = ''
+    $desc = ''
+    $props = @($Adapter.PSObject.Properties.Name)
+    if ($props -contains 'Name')                  { $name = [string]$Adapter.Name }
+    if ($props -contains 'InterfaceDescription')  { $desc = [string]$Adapter.InterfaceDescription }
+
+    # 网卡对象自带 Virtual 标记时优先采信（部分系统/版本会暴露该属性）
+    if ($props -contains 'Virtual') {
+        try { if ([bool]$Adapter.Virtual) { return $true } } catch { }
+    }
+
+    foreach ($pattern in $script:VirtualAdapterPatterns) {
+        if ($name -and ($name -like $pattern)) { return $true }
+        if ($desc -and ($desc -like $pattern)) { return $true }
+    }
+    return $false
+}
+
 function Get-AdapterList {
     try {
-        return @(Get-NetAdapter -ErrorAction Stop | Sort-Object { $_.InterfaceIndex })
+        $list = @(Get-NetAdapter -ErrorAction Stop | Sort-Object { $_.InterfaceIndex })
     } catch {
         Write-NSLog "读取网卡列表失败：$($_.Exception.Message)" 'ERROR'
         return @()
     }
+
+    # 安全第一：默认把虚拟 / 非物理网卡挡在门外，避免 adapter:"*" 这类通配配置误伤它们
+    if (-not $script:ExcludeVirtualAdapters) { return @($list) }
+
+    $kept    = @()
+    $skipped = @()
+    foreach ($adapter in $list) {
+        if (Test-VirtualAdapter $adapter) { $skipped += [string]$adapter.Name }
+        else                              { $kept   += $adapter }
+    }
+    if ($skipped.Count -gt 0) {
+        Write-NSLog "已跳过 $($skipped.Count) 块虚拟/非物理网卡（$($skipped -join '、')）。如需把它们也纳入管理，请在主界面勾选「包含虚拟网卡」，或把脚本变量 ExcludeVirtualAdapters 设为 false。" 'INFO'
+    }
+    return @($kept)
 }
 
 function Find-MatchedAdapters {
@@ -639,8 +836,218 @@ function Find-MatchedAdapters {
 
 # ============================== 核心：切换引擎 ==============================
 
+# ---------- 附加路由应用记录 ----------
+# Reset-InterfaceIPv4 只清 IPv4 地址和 0.0.0.0/0 默认路由，清不掉 NetSwitch 上次写入的附加路由，
+# 于是「配置集里删掉某条路由、再切一次、系统里那条还在」就成了必然。
+# 解决办法：把自己加过的路由记到脚本目录的 applied-routes.json，下次切换同一网卡时先按记录删一遍。
+# 存文件而不是只放内存，是因为图形界面切换完通常就退出了，内存记录会随之丢失。
+# 注意：只删自己加过的，绝不碰系统或用户手工添加的路由。
+
+function Get-AppliedRoutesPath {
+    $candidates = @()
+    if ($PSScriptRoot) { $candidates += (Join-Path $PSScriptRoot 'applied-routes.json') }
+    if (-not [string]::IsNullOrWhiteSpace($script:ConfigFile)) {
+        $dir = Split-Path -Parent $script:ConfigFile
+        if ($dir) { $candidates += (Join-Path $dir 'applied-routes.json') }
+    }
+    $candidates += (Join-Path ([System.IO.Path]::GetTempPath()) 'NetSwitch-applied-routes.json')
+
+    foreach ($path in $candidates) {
+        try {
+            # 试探写入，确认这个位置真的可写
+            [System.IO.File]::AppendAllText($path, '')
+            return $path
+        } catch {
+            continue
+        }
+    }
+    return ''
+}
+
+function Read-AppliedRoutes {
+    $path = Get-AppliedRoutesPath
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) { return @() }
+
+    try {
+        $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+
+        # 必须用 -InputObject：PS 5.1 里 'json' | ConvertFrom-Json 会把整个顶层数组
+        # 当成单个管道对象输出，外面再套 @() 就成了「1 个元素 = 整个数组」，取数会全错。
+        $parsed = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+
+        $result = @()
+        foreach ($item in @($parsed)) {
+            if ($null -eq $item) { continue }
+            $result += [pscustomobject][ordered]@{
+                InterfaceIndex    = [int]$item.interfaceIndex
+                DestinationPrefix = [string]$item.destinationPrefix
+                NextHop           = [string]$item.nextHop
+            }
+        }
+        return @($result)
+    } catch {
+        # 记录文件坏了就当没记录过，宁可漏删也不能让它影响切换
+        return @()
+    }
+}
+
+function Write-AppliedRoutes {
+    param([object[]]$Routes = @())
+
+    $path = Get-AppliedRoutesPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+
+    try {
+        $payload = @()
+        foreach ($route in (ConvertTo-Array $Routes)) {
+            $payload += [pscustomobject][ordered]@{
+                interfaceIndex    = [int]$route.InterfaceIndex
+                destinationPrefix = [string]$route.DestinationPrefix
+                nextHop           = [string]$route.NextHop
+            }
+        }
+        if ($payload.Count -eq 0) {
+            [System.IO.File]::WriteAllText($path, '[]', (New-Object System.Text.UTF8Encoding($false)))
+        } else {
+            # 用 -InputObject 而不是管道，避免单条记录时被拆成裸对象、下次读回来不是数组
+            $json = ConvertTo-Json -InputObject $payload -Depth 6
+            [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    } catch {
+        # 记不下来不影响切换，最坏结果是下次漏清一次
+    }
+}
+
+function Register-AppliedRoute {
+    param(
+        [int]$InterfaceIndex,
+        [string]$DestinationPrefix,
+        [string]$NextHop
+    )
+
+    $recorded = @(Read-AppliedRoutes)
+    foreach ($route in $recorded) {
+        if ($route.InterfaceIndex -eq $InterfaceIndex -and
+            $route.DestinationPrefix -eq $DestinationPrefix -and
+            $route.NextHop -eq $NextHop) { return }
+    }
+
+    $recorded += [pscustomobject][ordered]@{
+        InterfaceIndex    = $InterfaceIndex
+        DestinationPrefix = $DestinationPrefix
+        NextHop           = $NextHop
+    }
+    Write-AppliedRoutes -Routes $recorded
+}
+
+# 清掉 NetSwitch 之前为指定网卡加过的附加路由；$InterfaceIndex 为 0 时清全部
+function Clear-AppliedRoutes {
+    param([int]$InterfaceIndex = 0)
+
+    $recorded = @(Read-AppliedRoutes)
+    if ($recorded.Count -eq 0) { return }
+
+    $remaining = @()
+    foreach ($route in $recorded) {
+        if ($InterfaceIndex -ne 0 -and $route.InterfaceIndex -ne $InterfaceIndex) {
+            $remaining += $route
+            continue
+        }
+        try {
+            Remove-NetRoute -InterfaceIndex $route.InterfaceIndex -DestinationPrefix $route.DestinationPrefix `
+                            -NextHop $route.NextHop -Confirm:$false -ErrorAction Stop
+            Write-NSLog "  清理上次添加的附加路由 $($route.DestinationPrefix) -> $($route.NextHop)" 'OK'
+        } catch {
+            # 删不掉通常是它已经被系统或用户移除了；写普通日志即可，用 WARN 会每次切换都刷一条噪音
+            Write-NSLog "  附加路由 $($route.DestinationPrefix) -> $($route.NextHop) 已不存在，跳过清理" 'INFO'
+        }
+    }
+
+    Write-AppliedRoutes -Routes $remaining
+}
+
+# ---------- DHCP 续租等待 ----------
+# ipconfig /renew 返回时地址往往还没真正落位，原来只 Start-Sleep 300 毫秒就往下走，
+# 后面的 DNS 设置和状态刷新都建立在「已经有地址」的假设上。
+function Wait-DhcpAddress {
+    param(
+        [int]$InterfaceIndex,
+        [int]$TimeoutSeconds = 6
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 400
+        try {
+            # 排除 127.* 与 169.254.*（APIPA：DHCP 没拿到地址时系统临时分配的占位地址）
+            $addresses = @(Get-NetIPAddress -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop |
+                           Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' })
+            if ($addresses.Count -gt 0) { return [string]$addresses[0].IPAddress }
+        } catch {
+            # 网卡正在重置的瞬间读取会报错，下一轮再试
+        }
+    }
+    return ''
+}
+
+# ---------- 静态 IP 冲突探测 ----------
+# 尽力而为的探测，结论仅供参考：先删掉该地址的 ARP 缓存项，再发一次短超时 ping 逼出 ARP 请求，
+# 最后回查 ARP 表看有没有人应答。只有「ping 通」或「确实解析出 MAC」才判为疑似占用。
+# 离线设备、静态 ARP 项、虚拟网卡都会造成假阳性，所以它只能用来提示，绝不能用来自动中止切换。
+function Test-IpAddressConflict {
+    param(
+        [string]$IpAddress,
+        [int]$TimeoutMs = 800
+    )
+
+    if ([string]::IsNullOrWhiteSpace($IpAddress)) { return $false }
+    if ($IpAddress -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { return $false }
+
+    try { [void](& arp.exe -d $IpAddress 2>$null) } catch { }
+
+    try {
+        $ping  = New-Object System.Net.NetworkInformation.Ping
+        $reply = $ping.Send($IpAddress, $TimeoutMs)
+        if ($null -ne $reply -and $reply.Status -eq 'Success') { return $true }
+    } catch { }
+
+    # ping 不通也别急着下结论：不少主机禁 ICMP，但 ARP 仍会应答
+    try {
+        $pattern = [regex]::Escape($IpAddress.Trim())
+        foreach ($line in @(& arp.exe -a $IpAddress 2>$null)) {
+            if ($line -match $pattern -and $line -match '([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}') { return $true }
+        }
+    } catch { }
+
+    return $false
+}
+
+# 是否允许弹交互框。命令行 / 桌面快捷方式常以隐藏窗口运行（带 -Silent），
+# 这种场景弹 MessageBox 用户看不见也点不到，进程会永久挂死，只能写日志放行。
+function Test-CanInteract {
+    return (-not $script:IsCliMode)
+}
+
+# 把「默认路由跃点数」文本规范成整数，留空或非法一律返回 $null 由调用方按自动处理。
+# 合法区间 0~9999：0 也是有效值（WLAN 的 DHCP 默认路由 metric 就是 0，要压过它必须允许填 0）。
+function ConvertTo-MetricValue {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $trimmed = $Text.Trim()
+    if ($trimmed -notmatch '^\d{1,4}$') { return $null }
+    $value = [int]$trimmed
+    if ($value -lt 0 -or $value -gt 9999) { return $null }
+    return $value
+}
+
 function Reset-InterfaceIPv4 {
     param([int]$InterfaceIndex)
+
+    # 先按记录清掉 NetSwitch 上次为这块网卡加的附加路由：本函数只清 IPv4 地址和默认路由，
+    # 配置集里删掉的那条路由会一直残留在系统路由表里，只有靠这份记录才能删干净
+    Clear-AppliedRoutes -InterfaceIndex $InterfaceIndex
 
     Get-NetIPAddress -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -ne '127.0.0.1' } |
@@ -671,8 +1078,15 @@ function Set-AdapterConfig {
         }
         Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
         Start-Sleep -Milliseconds 300
-        # ipconfig /renew 需要网卡名称，配合 -ErrorAction 静默失败即可（多数情况下系统会自动完成续租）
+        # ipconfig /renew 需要网卡名称。这里后台发起续租、随后轮询地址是否落位，
+        # 而不是给它加 -Wait：续租失败时 ipconfig 最长要几十秒才返回，会把界面整个卡死。
         Start-Process -FilePath 'ipconfig' -ArgumentList "/renew", "`"$name`"" -WindowStyle Hidden -ErrorAction SilentlyContinue
+        $leasedIp = Wait-DhcpAddress -InterfaceIndex $index -TimeoutSeconds 6
+        if ($leasedIp) {
+            Write-NSLog "  已获取到 DHCP 地址 $leasedIp" 'OK'
+        } else {
+            Write-NSLog '  等待 DHCP 地址超时（6 秒）：网线未插好或网内没有 DHCP 服务器时属正常，配置已下发，可稍后手动执行 ipconfig /renew。' 'WARN'
+        }
         if ($dnsList.Count -gt 0 -and -not $Config.dhcpDns) {
             Set-DnsClientServerAddress -InterfaceIndex $index -ServerAddresses $dnsList -ErrorAction SilentlyContinue
         }
@@ -685,19 +1099,49 @@ function Set-AdapterConfig {
             return
         }
 
+        # 写入前先探一下这个地址是否已被局域网内其他设备占用。
+        # 探测结果不可靠（离线设备、静态 ARP 项都会造成假阳性），所以只 WARN + 让用户选，
+        # 绝不自动中止 —— 误拦会让用户切不了网，比误报严重得多。
+        if (Test-IpAddressConflict -IpAddress $ipAddress) {
+            Write-NSLog "  探测到 IP $ipAddress 可能已被局域网内其他设备占用。" 'WARN'
+            $proceed = $true
+            if (Test-CanInteract) {
+                Add-Type -AssemblyName System.Windows.Forms
+                $answer = [System.Windows.Forms.MessageBox]::Show(
+                    "探测到 IP 地址 $ipAddress 可能已被局域网内其他设备占用。`r`n`r`n继续写入可能造成 IP 冲突，导致两台机器都上不了网。`r`n`r`n如果确认该地址当前无人使用（对方已关机也可能触发本提示），可以选择「仍然继续」。",
+                    'NetSwitch - IP 可能冲突',
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                $proceed = ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+            }
+            if (-not $proceed) {
+                Write-NSLog "  已按用户选择跳过网卡「$name」的静态 IP 写入。" 'WARN'
+                return
+            }
+            Write-NSLog '  用户选择仍然继续写入。' 'INFO'
+        }
+
         $prefix = ConvertTo-PrefixLength $Config.mask
         Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 150
 
         $gateways = ConvertTo-GatewayEntry (($Config.gateways -join ';'))
-        if ($gateways.Count -eq 1 -and $null -eq $gateways[0].Metric) {
+        # 网卡上指定了「默认跃点」时，统一改走「先建地址、再手工建默认路由」这条路，
+        # 因为 New-NetIPAddress -DefaultGateway 会强行用系统默认 metric，覆盖不掉。
+        $configMetric = ConvertTo-MetricValue ([string]$Config.defaultMetric)
+        if ($gateways.Count -eq 1 -and $null -eq $gateways[0].Metric -and $null -eq $configMetric) {
             New-NetIPAddress -InterfaceIndex $index -IPAddress $ipAddress -PrefixLength $prefix `
                              -DefaultGateway $gateways[0].Address -ErrorAction Stop | Out-Null
         } else {
             New-NetIPAddress -InterfaceIndex $index -IPAddress $ipAddress -PrefixLength $prefix -ErrorAction Stop | Out-Null
             $step = 0
             foreach ($gateway in $gateways) {
-                $metric = if ($null -ne $gateway.Metric) { $gateway.Metric } else { 10 + $step }
+                # 优先级：网关串里写的 1.1.1.1:10  > 网卡的「默认跃点」  > 自动 10+序号
+                # 多个网关时即使指定了跃点也要逐个 +1，避免两条默认路由 metric 完全相同
+                $metric = if ($null -ne $gateway.Metric) { $gateway.Metric }
+                          elseif ($null -ne $configMetric) { $configMetric + $step }
+                          else { 10 + $step }
                 New-NetRoute -InterfaceIndex $index -DestinationPrefix '0.0.0.0/0' `
                              -NextHop $gateway.Address -RouteMetric $metric -ErrorAction SilentlyContinue | Out-Null
                 $step++
@@ -712,6 +1156,7 @@ function Set-AdapterConfig {
 
         $summary = "  IP=$ipAddress/$prefix"
         if ($gateways.Count -gt 0) { $summary += "  网关=$(($gateways | ForEach-Object { $_.Address }) -join ',')" }
+        if ($null -ne $configMetric) { $summary += "  默认跃点=$configMetric" }
         if ($dnsList.Count -gt 0)  { $summary += "  DNS=$($dnsList -join ',')" }
         Write-NSLog $summary 'OK'
     }
@@ -722,6 +1167,8 @@ function Set-AdapterConfig {
             Remove-NetRoute -DestinationPrefix $route.Destination -NextHop $route.NextHop -Confirm:$false -ErrorAction SilentlyContinue
             try {
                 New-NetRoute -InterfaceIndex $index -DestinationPrefix $route.Destination -NextHop $route.NextHop -ErrorAction Stop | Out-Null
+                # 记下这条是 NetSwitch 加的，下次切换前先按记录删，配置集里删掉的才不会残留
+                Register-AppliedRoute -InterfaceIndex $index -DestinationPrefix $route.Destination -NextHop $route.NextHop
                 Write-NSLog "  附加路由 $($route.Destination) -> $($route.NextHop)" 'OK'
             } catch {
                 Write-NSLog "  附加路由添加失败 $($route.Destination) -> $($route.NextHop)：$($_.Exception.Message)" 'WARN'
@@ -1119,10 +1566,81 @@ function Get-ProfileSummaryText {
     return $builder.ToString()
 }
 
+# 算出一个配置集真正会命中哪些网卡（只统计 enabled 的条目），用于「应用前确认」和「预览」。
+# 返回对象：.Count = 命中的网卡数量；.Text = 可直接展示的多行摘要（含每块网卡当前 IP）。
+# 走的是 Find-MatchedAdapters，因此与真正应用时的匹配结果完全一致（含虚拟网卡排除）。
+function Get-ProfileImpact {
+    param($SourceProfile)
+
+    $result = [pscustomobject]@{
+        Count = 0
+        Text  = ''
+    }
+    if ($null -eq $SourceProfile) { return $result }
+
+    $builder = New-Object System.Text.StringBuilder
+    $count   = 0
+
+    foreach ($config in (ConvertTo-Array $SourceProfile.adapters)) {
+        if (-not $config.enabled) { continue }
+
+        $matched = @(Find-MatchedAdapters ([string]$config.adapter))
+        if ($matched.Count -eq 0) { continue }
+
+        if ([string]$config.mode -eq 'dhcp') {
+            $modeText = 'DHCP 自动获取'
+        } else {
+            $ipText = [string]$config.ip
+            if ([string]::IsNullOrWhiteSpace($ipText.Trim())) { $ipText = '（未填写 IP）' }
+            $modeText = "静态 $ipText"
+        }
+
+        foreach ($adapter in $matched) {
+            $count++
+            $current = @(Get-NetIPAddress -InterfaceIndex ([int]$adapter.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                         Where-Object { $_.IPAddress -ne '127.0.0.1' } |
+                         ForEach-Object { $_.IPAddress })
+            $currentText = if ($current.Count -gt 0) { $current -join ', ' } else { '（当前无 IPv4）' }
+            [void]$builder.AppendLine("  • $($adapter.Name)")
+            [void]$builder.AppendLine("      当前 $currentText   →   $modeText")
+        }
+    }
+
+    $result.Count = $count
+    $result.Text  = $builder.ToString()
+    return $result
+}
+
+# 配置集列表项的第二行灰色摘要，例如「静态 192.168.120.130」「DHCP」
+function Get-ProfileBriefText {
+    param($SourceProfile)
+
+    if ($null -eq $SourceProfile) { return '' }
+
+    $adapters = @(ConvertTo-Array $SourceProfile.adapters)
+    if ($adapters.Count -eq 0) { return '(无网卡条目)' }
+
+    $first = $adapters[0]
+    if ([string]$first.mode -eq 'dhcp') {
+        $brief = 'DHCP'
+    } else {
+        $ip = [string]$first.ip
+        if ([string]::IsNullOrWhiteSpace($ip.Trim())) { $ip = '未填写 IP' }
+        $brief = "静态 $ip"
+    }
+    if (-not $first.enabled) { $brief += '（已停用）' }
+    if ($adapters.Count -gt 1) { $brief += "  +$($adapters.Count - 1) 项" }
+    return $brief
+}
+
 # ---------- 配置集编辑器 ----------
 
 function Show-ProfileEditor {
     param(
+        # 调用方历史上一直写成 -Profile，而参数本名是 SourceProfile；
+        # 未绑定时 $SourceProfile 恒为 $null，表现是「点编辑却打开空的新建窗口」。
+        # 这里保留 Profile 别名兜底，同时调用处已统一改为 -SourceProfile。
+        [Alias('Profile')]
         $SourceProfile,          # $null 表示新建
         [string[]]$AdapterNames
     )
@@ -1188,6 +1706,7 @@ function Show-ProfileEditor {
     [void]$table.Columns.Add('IP', [string])
     [void]$table.Columns.Add('Mask', [string])
     [void]$table.Columns.Add('Gateways', [string])
+    [void]$table.Columns.Add('Metric', [string])
     [void]$table.Columns.Add('DNS', [string])
     [void]$table.Columns.Add('Routes', [string])
     $table.Columns['Enabled'].DefaultValue = $true
@@ -1203,6 +1722,7 @@ function Show-ProfileEditor {
             $row['IP']       = [string]$ad.ip
             $row['Mask']     = [string]$ad.mask
             $row['Gateways'] = ((ConvertTo-StringList $ad.gateways) -join ';')
+            $row['Metric']   = if ($null -ne $ad.defaultMetric) { [string]$ad.defaultMetric } else { '' }
             $row['DNS']      = ((ConvertTo-StringList $ad.dns) -join ';')
             $row['Routes']   = ((ConvertTo-StringList $ad.routes) -join ';')
             [void]$table.Rows.Add($row)
@@ -1254,6 +1774,11 @@ function Show-ProfileEditor {
     $colGw.Name = 'Gateways'; $colGw.DataPropertyName = 'Gateways'
     $colGw.HeaderText = '网关[:跃点]'; $colGw.FillWeight = 56
 
+    # 默认路由跃点数（可选）：留空=自动；填了就覆盖「单网关用系统默认值 / 多网关 10+序号」的行为
+    $colMetric = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colMetric.Name = 'Metric'; $colMetric.DataPropertyName = 'Metric'
+    $colMetric.HeaderText = '默认跃点(可选)'; $colMetric.FillWeight = 34
+
     $colDns = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colDns.Name = 'DNS'; $colDns.DataPropertyName = 'DNS'
     $colDns.HeaderText = 'DNS 服务器'; $colDns.FillWeight = 54
@@ -1262,7 +1787,7 @@ function Show-ProfileEditor {
     $colRoutes.Name = 'Routes'; $colRoutes.DataPropertyName = 'Routes'
     $colRoutes.HeaderText = '附加路由(可选)'; $colRoutes.FillWeight = 62
 
-    foreach ($col in @($colEnabled, $colAdapter, $colMode, $colIp, $colMask, $colGw, $colDns, $colRoutes)) {
+    foreach ($col in @($colEnabled, $colAdapter, $colMode, $colIp, $colMask, $colGw, $colMetric, $colDns, $colRoutes)) {
         [void]$grid.Columns.Add($col)
     }
 
@@ -1321,6 +1846,7 @@ function Show-ProfileEditor {
         $newRow['IP']       = $currentIp
         $newRow['Mask']     = $currentMask
         $newRow['Gateways'] = $gwText
+        $newRow['Metric']   = ''
         $newRow['DNS']      = ''
         $newRow['Routes']   = ''
         [void]$table.Rows.Add($newRow)
@@ -1343,6 +1869,7 @@ function Show-ProfileEditor {
         $newRow['IP']       = ''
         $newRow['Mask']     = '255.255.255.0'
         $newRow['Gateways'] = ''
+        $newRow['Metric']   = ''
         $newRow['DNS']      = ''
         $newRow['Routes']   = ''
         [void]$table.Rows.Add($newRow)
@@ -1396,6 +1923,7 @@ function Show-ProfileEditor {
                 gateways = @(Split-ItemList ([string]$row['Gateways']))
                 dns      = $dnsArray
                 dhcpDns  = ($dnsArray.Count -eq 0)
+                defaultMetric = ConvertTo-MetricValue ([string]$row['Metric'])
                 routes   = @(Split-ItemList ([string]$row['Routes']))
             }
         }
@@ -1484,6 +2012,14 @@ function Show-BackupManager {
     $btnOpenDir.BackColor = [System.Drawing.Color]::FromArgb(110, 122, 140)
     $btnOpenDir.ForeColor = [System.Drawing.Color]::White
 
+    $btnRestoreDirect = New-Object System.Windows.Forms.Button
+    $btnRestoreDirect.Text = '还原此备份到网卡'
+    $btnRestoreDirect.Location = New-Object System.Drawing.Point(314, 356)
+    $btnRestoreDirect.Size = New-Object System.Drawing.Size(140, 36)
+    $btnRestoreDirect.FlatStyle = 'Flat'
+    $btnRestoreDirect.BackColor = [System.Drawing.Color]::FromArgb(200, 130, 40)
+    $btnRestoreDirect.ForeColor = [System.Drawing.Color]::White
+
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = '关闭'
     $btnClose.Location = New-Object System.Drawing.Point(454, 356)
@@ -1517,9 +2053,66 @@ function Show-BackupManager {
         } catch { }
     })
 
+    $btnRestoreDirect.Add_Click({
+        if ($list.SelectedIndex -lt 0) {
+            [System.Windows.Forms.MessageBox]::Show('请先选择一条备份记录。', '提示', 'OK', 'Information') | Out-Null
+            return
+        }
+        $file = $files[$list.SelectedIndex].FullName
+
+        # 写网卡必须有管理员权限，先问一次要不要提权重开
+        if (-not (Test-IsAdmin)) {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "还原备份需要管理员权限。`n是否现在切换到管理员模式运行？",
+                '需要管理员权限', 'YesNo', 'Question')
+            if ($answer -eq 'Yes') {
+                if (Start-Elevated) { $form.Close() }
+                return
+            }
+            Write-NSLog '未获得管理员权限，已取消还原备份。' 'WARN'
+            return
+        }
+
+        $names = @()
+        try {
+            $names = @(Get-BackupRestoreTargets -Path $file | ForEach-Object { $_.Adapter.Name })
+        } catch {
+            Write-NSLog "读取备份失败：$($_.Exception.Message)" 'ERROR'
+            [System.Windows.Forms.MessageBox]::Show("读取备份失败：$($_.Exception.Message)", '错误', 'OK', 'Error') | Out-Null
+            return
+        }
+
+        if ($names.Count -eq 0) {
+            Write-NSLog "备份中没有匹配到本机现有的网卡，已取消还原：$file" 'WARN'
+            [System.Windows.Forms.MessageBox]::Show(
+                '这份备份里的网卡在本机上都找不到，无法还原。', '提示', 'OK', 'Information') | Out-Null
+            return
+        }
+
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "即将把这份备份直接写回以下网卡：`n`n" + ($names -join "`n") +
+            "`n`n还原过程中网络会短暂断开，是否继续？",
+            '确认还原', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { Write-NSLog '已取消还原备份。' 'INFO'; return }
+
+        $form.Cursor = 'WaitCursor'
+        try {
+            if (Restore-BackupToAdapters -Path $file) {
+                $script:BackupManagerChanged = $true
+                [System.Windows.Forms.MessageBox]::Show(
+                    '备份已还原到网卡，请查看日志确认结果。', '还原完成', 'OK', 'Information') | Out-Null
+            } else {
+                [System.Windows.Forms.MessageBox]::Show(
+                    '还原未全部成功，请查看日志了解详情。', '还原未完成', 'OK', 'Warning') | Out-Null
+            }
+        } finally {
+            $form.Cursor = 'Default'
+        }
+    })
+
     $btnClose.Add_Click({ $form.Close() })
 
-    $form.Controls.AddRange(@($lblDir, $list, $lblTip, $btnRestore, $btnOpenDir, $btnClose))
+    $form.Controls.AddRange(@($lblDir, $list, $lblTip, $btnRestore, $btnOpenDir, $btnRestoreDirect, $btnClose))
     [void]$form.ShowDialog()
 
     return $script:BackupManagerChanged
@@ -1600,7 +2193,7 @@ function Show-MainForm {
     $lstProfiles.Anchor = 'Top, Bottom, Left, Right'
     $lstProfiles.Font = New-FormFont 10
     $lstProfiles.DrawMode = 'OwnerDrawFixed'
-    $lstProfiles.ItemHeight = 26
+    $lstProfiles.ItemHeight = 40
     $lstProfiles.BorderStyle = 'FixedSingle'
 
     $lstProfiles.Add_DrawItem({
@@ -1611,14 +2204,29 @@ function Show-MainForm {
         $selected = (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)
         $backColor = if ($selected) { [System.Drawing.Color]::FromArgb(52, 152, 219) } else { [System.Drawing.Color]::White }
         $foreColor = if ($selected) { [System.Drawing.Color]::White } else { [System.Drawing.Color]::FromArgb(45, 55, 70) }
+        $subColor  = if ($selected) { [System.Drawing.Color]::FromArgb(214, 234, 250) } else { [System.Drawing.Color]::FromArgb(132, 142, 156) }
         $brush = New-Object System.Drawing.SolidBrush($backColor)
         $e.Graphics.FillRectangle($brush, $e.Bounds)
         $brush.Dispose()
+
+        # 第二行灰色次要信息：取自该配置集首个网卡条目的 mode / ip
+        $subText = ''
+        $itemProfile = Get-ProfileByName $text
+        if ($null -ne $itemProfile) { $subText = Get-ProfileBriefText $itemProfile }
+
         $font = New-FormFont 10
+        $subFont = New-FormFont 8
         $textBrush = New-Object System.Drawing.SolidBrush($foreColor)
-        $textRect = New-Object System.Drawing.RectangleF(10, ($e.Bounds.Y + 4), ($e.Bounds.Width - 10), 20)
+        $subBrush = New-Object System.Drawing.SolidBrush($subColor)
+        # 注意：RectangleF 的每个参数都必须单独加括号，否则 PowerShell 会把逗号解析成
+        # 数组构造运算符，进而触发 [System.Object[]] 的 op_Subtraction 异常。切勿去掉括号。
+        $textRect = New-Object System.Drawing.RectangleF(10, ($e.Bounds.Y + 3), ($e.Bounds.Width - 16), 18)
+        $subRect  = New-Object System.Drawing.RectangleF(10, ($e.Bounds.Y + 21), ($e.Bounds.Width - 16), 15)
         $e.Graphics.DrawString($text, $font, $textBrush, $textRect)
+        if ($subText) { $e.Graphics.DrawString($subText, $subFont, $subBrush, $subRect) }
+        $subBrush.Dispose()
         $textBrush.Dispose()
+        $subFont.Dispose()
         $font.Dispose()
         $e.DrawFocusRectangle()
     })
@@ -1650,7 +2258,17 @@ function Show-MainForm {
     $btnDown    = & $mkButton '下移'  70   468 62 30 $gray
     $btnImport  = & $mkButton '导入配置' 138 468 126 30 $gray
 
-    $side.Controls.AddRange(@($lblSide, $lstProfiles, $btnNew, $btnCopy, $btnEdit, $btnDelete, $btnUp, $btnDown, $btnImport))
+    # 虚拟网卡排除开关：默认不勾选（即排除 VMware / 蓝牙 / 环回 / 本地连接* 等网卡）。
+    # 勾选后等价于把 $script:ExcludeVirtualAdapters 设为 $false，所有网卡都可能被匹配到。
+    $chkIncludeVirtual = New-Object System.Windows.Forms.CheckBox
+    $chkIncludeVirtual.Text = '包含虚拟网卡（VMware/蓝牙等）'
+    $chkIncludeVirtual.Location = New-Object System.Drawing.Point(2, 506)
+    $chkIncludeVirtual.Size = New-Object System.Drawing.Size(258, 22)
+    $chkIncludeVirtual.Anchor = 'Bottom, Left'
+    $chkIncludeVirtual.ForeColor = [System.Drawing.Color]::FromArgb(110, 122, 140)
+    $chkIncludeVirtual.Checked = (-not $script:ExcludeVirtualAdapters)
+
+    $side.Controls.AddRange(@($lblSide, $lstProfiles, $btnNew, $btnCopy, $btnEdit, $btnDelete, $btnUp, $btnDown, $btnImport, $chkIncludeVirtual))
 
     # ===== 右侧 =====
     $right = New-Object System.Windows.Forms.Panel
@@ -1698,65 +2316,76 @@ function Show-MainForm {
     $action.Size = New-Object System.Drawing.Size(866, 46)
     $action.Anchor = 'Top, Left, Right'
 
+    # 操作区共 8 个按钮，容器宽 866px，相邻间隔统一 6px：
+    # 宽度合计 = 866 - 7*6 = 824
+    #   X: 0(128) 134(116) 256(136) 398(88) 492(92) 590(88) 684(104) 794(72) -> 右边缘 866
     $btnApply = New-Object System.Windows.Forms.Button
     $btnApply.Text = '应用此配置集'
     $btnApply.Location = New-Object System.Drawing.Point(0, 6)
-    $btnApply.Size = New-Object System.Drawing.Size(160, 36)
+    $btnApply.Size = New-Object System.Drawing.Size(128, 36)
     $btnApply.BackColor = [System.Drawing.Color]::SeaGreen
     $btnApply.ForeColor = [System.Drawing.Color]::White
     $btnApply.FlatStyle = 'Flat'
     $btnApply.Font = New-FormFont 10 Bold
 
+    $btnPreview = New-Object System.Windows.Forms.Button
+    $btnPreview.Text = '预览此配置集'
+    $btnPreview.Location = New-Object System.Drawing.Point(134, 6)
+    $btnPreview.Size = New-Object System.Drawing.Size(116, 36)
+    $btnPreview.FlatStyle = 'Flat'
+    $btnPreview.BackColor = [System.Drawing.Color]::FromArgb(90, 150, 190)
+    $btnPreview.ForeColor = [System.Drawing.Color]::White
+
     $btnShortcut = New-Object System.Windows.Forms.Button
     $btnShortcut.Text = '生成桌面快捷方式'
-    $btnShortcut.Location = New-Object System.Drawing.Point(166, 6)
-    $btnShortcut.Size = New-Object System.Drawing.Size(156, 36)
+    $btnShortcut.Location = New-Object System.Drawing.Point(256, 6)
+    $btnShortcut.Size = New-Object System.Drawing.Size(136, 36)
     $btnShortcut.FlatStyle = 'Flat'
     $btnShortcut.BackColor = [System.Drawing.Color]::FromArgb(70, 130, 180)
     $btnShortcut.ForeColor = [System.Drawing.Color]::White
 
     $btnRefresh = New-Object System.Windows.Forms.Button
     $btnRefresh.Text = '刷新状态'
-    $btnRefresh.Location = New-Object System.Drawing.Point(328, 6)
-    $btnRefresh.Size = New-Object System.Drawing.Size(104, 36)
+    $btnRefresh.Location = New-Object System.Drawing.Point(398, 6)
+    $btnRefresh.Size = New-Object System.Drawing.Size(88, 36)
     $btnRefresh.FlatStyle = 'Flat'
     $btnRefresh.BackColor = $gray
     $btnRefresh.ForeColor = [System.Drawing.Color]::White
 
     $btnBackup = New-Object System.Windows.Forms.Button
     $btnBackup.Text = '备份记录'
-    $btnBackup.Location = New-Object System.Drawing.Point(438, 6)
-    $btnBackup.Size = New-Object System.Drawing.Size(112, 36)
+    $btnBackup.Location = New-Object System.Drawing.Point(492, 6)
+    $btnBackup.Size = New-Object System.Drawing.Size(92, 36)
     $btnBackup.FlatStyle = 'Flat'
     $btnBackup.BackColor = [System.Drawing.Color]::FromArgb(150, 112, 50)
     $btnBackup.ForeColor = [System.Drawing.Color]::White
 
     $btnExport = New-Object System.Windows.Forms.Button
     $btnExport.Text = '导出配置'
-    $btnExport.Location = New-Object System.Drawing.Point(556, 6)
-    $btnExport.Size = New-Object System.Drawing.Size(104, 36)
+    $btnExport.Location = New-Object System.Drawing.Point(590, 6)
+    $btnExport.Size = New-Object System.Drawing.Size(88, 36)
     $btnExport.FlatStyle = 'Flat'
     $btnExport.BackColor = $gray
     $btnExport.ForeColor = [System.Drawing.Color]::White
 
     $btnOpenFile = New-Object System.Windows.Forms.Button
     $btnOpenFile.Text = '打开配置文件'
-    $btnOpenFile.Location = New-Object System.Drawing.Point(666, 6)
-    $btnOpenFile.Size = New-Object System.Drawing.Size(118, 36)
+    $btnOpenFile.Location = New-Object System.Drawing.Point(684, 6)
+    $btnOpenFile.Size = New-Object System.Drawing.Size(104, 36)
     $btnOpenFile.FlatStyle = 'Flat'
     $btnOpenFile.BackColor = $gray
     $btnOpenFile.ForeColor = [System.Drawing.Color]::White
 
     $btnCopyLog = New-Object System.Windows.Forms.Button
     $btnCopyLog.Text = '复制日志'
-    $btnCopyLog.Location = New-Object System.Drawing.Point(790, 6)
-    $btnCopyLog.Size = New-Object System.Drawing.Size(76, 36)
+    $btnCopyLog.Location = New-Object System.Drawing.Point(794, 6)
+    $btnCopyLog.Size = New-Object System.Drawing.Size(72, 36)
     $btnCopyLog.FlatStyle = 'Flat'
     $btnCopyLog.BackColor = [System.Drawing.Color]::FromArgb(90, 100, 120)
     $btnCopyLog.ForeColor = [System.Drawing.Color]::White
     $btnCopyLog.Anchor = 'Top, Right'
 
-    $action.Controls.AddRange(@($btnApply, $btnShortcut, $btnRefresh, $btnBackup, $btnExport, $btnOpenFile, $btnCopyLog))
+    $action.Controls.AddRange(@($btnApply, $btnPreview, $btnShortcut, $btnRefresh, $btnBackup, $btnExport, $btnOpenFile, $btnCopyLog))
 
     # 日志
     $grpLog = New-Object System.Windows.Forms.GroupBox
@@ -1862,7 +2491,7 @@ function Show-MainForm {
             return
         }
         $original = Get-ProfileByName ([string]$lstProfiles.SelectedItem)
-        $edited = Show-ProfileEditor -Profile $original -AdapterNames (& $getAdapterNames)
+        $edited = Show-ProfileEditor -SourceProfile $original -AdapterNames (& $getAdapterNames)
         if ($null -ne $edited) {
             $index = 0
             $position = 0
@@ -1887,7 +2516,7 @@ function Show-MainForm {
     $btnEdit.Add_Click({ & $script:EditAction })
 
     $btnNew.Add_Click({
-        $created = Show-ProfileEditor -Profile $null -AdapterNames (& $getAdapterNames)
+        $created = Show-ProfileEditor -SourceProfile $null -AdapterNames (& $getAdapterNames)
         if ($null -ne $created) {
             $script:ConfigData.profiles = [object[]]@((ConvertTo-Array $script:ConfigData.profiles) + $created)
             Save-ConfigFile | Out-Null
@@ -1964,6 +2593,16 @@ function Show-MainForm {
         }
     })
 
+    $chkIncludeVirtual.Add_CheckedChanged({
+        $script:ExcludeVirtualAdapters = (-not $chkIncludeVirtual.Checked)
+        if ($script:ExcludeVirtualAdapters) {
+            Write-NSLog '已排除虚拟网卡：VMware / VirtualBox / Hyper-V / 蓝牙 / 环回 / 本地连接* 等不会被配置集匹配。' 'INFO'
+        } else {
+            Write-NSLog '已取消虚拟网卡排除：所有网卡都可能被「*」之类的通配匹配到，请确认后再应用。' 'WARN'
+        }
+        & $refreshStatus
+    })
+
     $btnBackup.Add_Click({
         if (Show-BackupManager) { & $reloadProfiles }
     })
@@ -2024,8 +2663,19 @@ function Show-MainForm {
             Write-NSLog '未获得管理员权限，已取消应用。' 'WARN'
             return
         }
+        # 动手之前先把实际会命中哪几块网卡列出来，让用户确认，避免通配匹配误伤其它网卡
+        $target = Get-ProfileByName $name
+        $impact = Get-ProfileImpact $target
+        if ($impact.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "配置集「$name」没有匹配到任何可操作的网卡，已中止。`n`n可能原因：`n  1) 配置集里的网卡条目全部处于「停用」状态；`n  2) 网卡匹配名写错，本机不存在同名网卡；`n  3) 目标网卡被虚拟网卡排除规则挡掉了（可在主界面左下角勾选「包含虚拟网卡」后再试）。",
+                '无法应用', 'OK', 'Warning') | Out-Null
+            Write-NSLog "配置集「$name」匹配到 0 块网卡，已中止应用。" 'WARN'
+            return
+        }
+
         $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "即将切换到配置集：「$name」`n切换过程中网络会短暂断开，是否继续？",
+            "即将切换到配置集：「$name」`n`n本次将影响以下 $($impact.Count) 块网卡：`n$($impact.Text)`n切换过程中网络会短暂断开，是否继续？",
             '确认切换', 'YesNo', 'Question')
         if ($confirm -ne 'Yes') { Write-NSLog '已取消切换。' 'INFO'; return }
 
@@ -2036,6 +2686,37 @@ function Show-MainForm {
             $form.Cursor = 'Default'
             & $refreshStatus
         }
+    })
+
+    # 预览：调用 Invoke-Profile -DryRun（只写日志、不碰网络），再把命中范围弹给用户
+    $btnPreview.Add_Click({
+        if ($lstProfiles.SelectedIndex -lt 0) {
+            [System.Windows.Forms.MessageBox]::Show('请先选择一个配置集。', '提示', 'OK', 'Information') | Out-Null
+            return
+        }
+        $name = [string]$lstProfiles.SelectedItem
+        $target = Get-ProfileByName $name
+        if ($null -eq $target) {
+            Write-NSLog "找不到配置集「$name」，无法预览。" 'ERROR'
+            return
+        }
+
+        Write-NSLog "预览配置集「$name」（不会修改任何网络设置）" 'INFO'
+        [void](Invoke-Profile -ProfileName $name -DryRun)
+
+        $impact = Get-ProfileImpact $target
+        if ($impact.Count -eq 0) {
+            Write-NSLog "预览结果：「$name」没有匹配到任何网卡。" 'WARN'
+            [System.Windows.Forms.MessageBox]::Show(
+                "配置集「$name」没有匹配到任何可操作的网卡。`n`n请检查网卡匹配名，或在主界面左下角勾选「包含虚拟网卡」。",
+                '预览结果', 'OK', 'Warning') | Out-Null
+            return
+        }
+
+        Write-NSLog "预览结果：「$name」将影响 $($impact.Count) 块网卡。" 'OK'
+        [System.Windows.Forms.MessageBox]::Show(
+            "配置集「$name」将影响以下 $($impact.Count) 块网卡（预览，未做任何修改）：`n$($impact.Text)",
+            '预览结果', 'OK', 'Information') | Out-Null
     })
 
     $btnShortcut.Add_Click({
