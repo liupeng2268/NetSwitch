@@ -818,19 +818,77 @@ function Get-AdapterList {
     return @($kept)
 }
 
+# 把各种写法的 MAC 地址归一化成「只剩十六进制字符的大写串」，
+# 这样 B0-25-AA-6F-36-44 / b0:25:aa:6f:36:44 / B025AA6F3644 都能互相认出来
+function ConvertTo-MacKey {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return (([string]$Value).ToUpperInvariant() -replace '[^0-9A-F]', '')
+}
+
+# 把 InterfaceGuid 归一化成「无大括号、无首尾空白、全小写」的串，便于比较与前缀匹配
+function ConvertTo-GuidKey {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return ((([string]$Value).Trim() -replace '[{}]', '').Trim().ToLowerInvariant())
+}
+
 function Find-MatchedAdapters {
     param([string]$Pattern)
 
     $all = Get-AdapterList
     if ([string]::IsNullOrWhiteSpace($Pattern) -or $Pattern -eq '*') { return $all }
 
+    # 第一级：网卡名称精确匹配（最常见的正常路径，不打日志，避免刷新/预览时刷屏）
     $exact = @($all | Where-Object { $_.Name -eq $Pattern })
     if ($exact.Count -gt 0) { return $exact }
 
+    # 第二级：网卡名称模糊匹配（同样是正常路径，不打日志）
     $fuzzy = @($all | Where-Object { $_.Name -like "*$Pattern*" })
     if ($fuzzy.Count -gt 0) { return $fuzzy }
 
-    Write-NSLog "未找到匹配「$Pattern」的网卡，已跳过该项配置。" 'WARN'
+    # 第三级：按稳定标识匹配（硬件描述 / MAC / InterfaceGuid）。
+    # 走到这里说明网卡很可能被改过名，值得记一条日志说明命中的依据。
+    # 网卡在 Windows 里被改名后，前两级必然落空；这三项不随改名变化，是最可靠的兜底。
+    $macKey  = ConvertTo-MacKey  $Pattern
+    $guidKey = ConvertTo-GuidKey $Pattern
+
+    # 硬件描述：用户往往只记得「Realtek」「Intel」这类片段，所以做模糊匹配
+    $byDesc = @($all | Where-Object { $_.InterfaceDescription -like "*$Pattern*" })
+    if ($byDesc.Count -gt 0) {
+        $descNames = @($byDesc | ForEach-Object { [string]$_.Name }) -join '、'
+        Write-NSLog "网卡「$Pattern」按硬件描述匹配到 $($byDesc.Count) 块网卡（$descNames）。" 'INFO'
+        return $byDesc
+    }
+
+    # MAC：不适合模糊匹配，只在归一化后完全相等、且长度足够时才认定命中
+    if ($macKey.Length -ge 6) {
+        $byMac = @($all | Where-Object { (ConvertTo-MacKey ([string]$_.MacAddress)) -eq $macKey })
+        if ($byMac.Count -gt 0) {
+            $macNames = @($byMac | ForEach-Object { [string]$_.Name }) -join '、'
+            Write-NSLog "网卡「$Pattern」按 MAC 地址匹配到 $($byMac.Count) 块网卡（$macNames）。" 'INFO'
+            return $byMac
+        }
+    }
+
+    # GUID：支持完全相等或前缀匹配（配置里可能只填了前一小段）
+    if ($guidKey.Length -ge 8) {
+        $byGuid = @()
+        foreach ($candidate in $all) {
+            $key = ConvertTo-GuidKey ([string]$candidate.InterfaceGuid)
+            if ($key.Length -lt 8) { continue }
+            if ($key -eq $guidKey -or $key -like "$guidKey*" -or $guidKey -like "$key*") { $byGuid += $candidate }
+        }
+        if ($byGuid.Count -gt 0) {
+            $guidNames = @($byGuid | ForEach-Object { [string]$_.Name }) -join '、'
+            Write-NSLog "网卡「$Pattern」按 InterfaceGuid 匹配到 $($byGuid.Count) 块网卡（$guidNames）。" 'INFO'
+            return $byGuid
+        }
+    }
+
+    Write-NSLog "未找到匹配「$Pattern」的网卡，已跳过该项配置。网卡匹配字段可以填网卡名称（如「以太网」）、硬件描述（如 Realtek PCIe GbE Family Controller）或 MAC 地址（如 B0-25-AA-6F-36-44）；填硬件描述或 MAC 时，以后在系统里给网卡改名也不会失效。" 'WARN'
     return @()
 }
 
@@ -1633,6 +1691,166 @@ function Get-ProfileBriefText {
     return $brief
 }
 
+# ---------- 重新绑定网卡 ----------
+
+# 配置集里写的网卡名，一旦用户在 Windows 里把网卡改了名（「以太网」→「内网」），按名称匹配就会落空，
+# 整个配置集随之失效。这里弹出一个对话框：左边列配置集里的网卡条目，右边列本机真实网卡，
+# 让用户挑一条重新绑定，并按「网卡名称」或「MAC 地址」写回配置集（MAC 不随改名变化，故为推荐项）。
+# 成功重绑返回 $true，用户取消或出错返回 $false；异常一律吞掉并记日志，不让其冒泡。
+function Show-AdapterRebindDialog {
+    param(
+        [Alias('Profile')]
+        $SourceProfile
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+
+        if ($null -eq $SourceProfile) {
+            Write-NSLog '重新绑定网卡失败：没有指定配置集。' 'ERROR'
+            return $false
+        }
+
+        $profileName = [string]$SourceProfile.name
+        $entries = @(ConvertTo-Array $SourceProfile.adapters)
+        if ($entries.Count -eq 0) {
+            Write-NSLog "重新绑定网卡失败：配置集「$profileName」里没有网卡条目。" 'ERROR'
+            return $false
+        }
+
+        # 复用 Get-AdapterList：它已经按开关排除了虚拟/非物理网卡
+        $adapters = @(Get-AdapterList)
+        if ($adapters.Count -eq 0) {
+            Write-NSLog '重新绑定网卡失败：本机没有可用的网卡（可能都被虚拟网卡排除规则挡掉了）。' 'ERROR'
+            return $false
+        }
+
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = '重新绑定网卡'
+        $form.Size = New-Object System.Drawing.Size(520, 420)
+        $form.MinimumSize = New-Object System.Drawing.Size(480, 380)
+        $form.StartPosition = 'CenterParent'
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+        $form.Font = New-FormFont 9
+
+        $lblEntries = New-Object System.Windows.Forms.Label
+        $lblEntries.Text = "配置集「$profileName」里匹配不到的网卡条目："
+        $lblEntries.Location = New-Object System.Drawing.Point(12, 12)
+        $lblEntries.Size = New-Object System.Drawing.Size(480, 20)
+
+        $lstEntries = New-Object System.Windows.Forms.ListBox
+        $lstEntries.Location = New-Object System.Drawing.Point(12, 34)
+        $lstEntries.Size = New-Object System.Drawing.Size(480, 76)
+        $lstEntries.Font = New-MonoFont 9
+        foreach ($entry in $entries) {
+            [void]$lstEntries.Items.Add([string]$entry.adapter)
+        }
+        if ($lstEntries.Items.Count -gt 0) { $lstEntries.SelectedIndex = 0 }
+
+        $lblAdapters = New-Object System.Windows.Forms.Label
+        $lblAdapters.Text = '选择要绑定到哪块网卡（已排除虚拟网卡）：'
+        $lblAdapters.Location = New-Object System.Drawing.Point(12, 116)
+        $lblAdapters.Size = New-Object System.Drawing.Size(480, 20)
+
+        $lstAdapters = New-Object System.Windows.Forms.ListBox
+        $lstAdapters.Location = New-Object System.Drawing.Point(12, 138)
+        $lstAdapters.Size = New-Object System.Drawing.Size(480, 150)
+        $lstAdapters.Font = New-MonoFont 9
+        foreach ($nic in $adapters) {
+            [void]$lstAdapters.Items.Add(('{0}  |  {1}  |  {2}' -f [string]$nic.Name, [string]$nic.InterfaceDescription, [string]$nic.MacAddress))
+        }
+        if ($lstAdapters.Items.Count -gt 0) { $lstAdapters.SelectedIndex = 0 }
+
+        $lblMode = New-Object System.Windows.Forms.Label
+        $lblMode.Text = '绑定方式：'
+        $lblMode.Location = New-Object System.Drawing.Point(12, 296)
+        $lblMode.Size = New-Object System.Drawing.Size(70, 20)
+
+        $rbName = New-Object System.Windows.Forms.RadioButton
+        $rbName.Text = '按网卡名称'
+        $rbName.Location = New-Object System.Drawing.Point(84, 292)
+        $rbName.Size = New-Object System.Drawing.Size(150, 24)
+        $rbName.Checked = $false
+
+        $rbMac = New-Object System.Windows.Forms.RadioButton
+        $rbMac.Text = '按 MAC 地址（推荐：以后改名也不会失效）'
+        $rbMac.Location = New-Object System.Drawing.Point(236, 292)
+        $rbMac.Size = New-Object System.Drawing.Size(256, 24)
+        $rbMac.Checked = $true
+
+        $btnBind = New-Object System.Windows.Forms.Button
+        $btnBind.Text = '绑定'
+        $btnBind.Location = New-Object System.Drawing.Point(292, 330)
+        $btnBind.Size = New-Object System.Drawing.Size(96, 32)
+        $btnBind.BackColor = [System.Drawing.Color]::SeaGreen
+        $btnBind.ForeColor = [System.Drawing.Color]::White
+        $btnBind.FlatStyle = 'Flat'
+
+        $btnCancel = New-Object System.Windows.Forms.Button
+        $btnCancel.Text = '取消'
+        $btnCancel.Location = New-Object System.Drawing.Point(396, 330)
+        $btnCancel.Size = New-Object System.Drawing.Size(96, 32)
+        $btnCancel.FlatStyle = 'Flat'
+
+        $form.AcceptButton = $btnBind
+        $form.CancelButton = $btnCancel
+
+        $btnBind.Add_Click({
+            try {
+                if ($lstEntries.SelectedIndex -lt 0) {
+                    [System.Windows.Forms.MessageBox]::Show('请先选择要重新绑定的网卡条目。', '提示', 'OK', 'Information') | Out-Null
+                    return
+                }
+                if ($lstAdapters.SelectedIndex -lt 0) {
+                    [System.Windows.Forms.MessageBox]::Show('请选择要绑定到哪一块本机网卡。', '提示', 'OK', 'Information') | Out-Null
+                    return
+                }
+
+                $entry = $entries[$lstEntries.SelectedIndex]
+                $nic   = $adapters[$lstAdapters.SelectedIndex]
+
+                $useMac   = [bool]$rbMac.Checked
+                $newValue = if ($useMac) { [string]$nic.MacAddress } else { [string]$nic.Name }
+                if ([string]::IsNullOrWhiteSpace($newValue)) { $newValue = [string]$nic.Name }
+                $oldValue = [string]$entry.adapter
+                $how      = if ($useMac) { 'MAC 地址' } else { '网卡名称' }
+
+                if ($entry.PSObject.Properties.Name -contains 'adapter') {
+                    $entry.adapter = $newValue
+                } else {
+                    $entry | Add-Member NoteProperty adapter $newValue -Force
+                }
+
+                Save-ConfigFile | Out-Null
+                Write-NSLog "配置集「$profileName」已重新绑定网卡条目：「$oldValue」→「$newValue」（按 $how）。" 'OK'
+
+                $form.DialogResult = 'OK'
+                $form.Close()
+            } catch {
+                Write-NSLog "重新绑定网卡失败：$($_.Exception.Message)" 'ERROR'
+                $form.DialogResult = 'Cancel'
+                $form.Close()
+            }
+        })
+
+        $btnCancel.Add_Click({
+            $form.DialogResult = 'Cancel'
+            $form.Close()
+        })
+
+        $form.Controls.AddRange(@($lblEntries, $lstEntries, $lblAdapters, $lstAdapters, $lblMode, $rbName, $rbMac, $btnBind, $btnCancel))
+
+        $result = $form.ShowDialog()
+        return ($result -eq [System.Windows.Forms.DialogResult]::OK)
+    } catch {
+        Write-NSLog "打开重新绑定网卡对话框失败：$($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+
 # ---------- 配置集编辑器 ----------
 
 function Show-ProfileEditor {
@@ -1694,8 +1912,9 @@ function Show-ProfileEditor {
 
     $lblTip = New-Object System.Windows.Forms.Label
     $lblTip.Text = "填写方式：在下方表格里双击单元格，直接输入 IP / 子网掩码 / 网关 / DNS；最左侧「启用」列打勾表示该行生效。`n" +
-                   '提示：网关可写为 192.168.1.1:10 指定跃点数，多个网关或 DNS 用分号隔开；附加路由写法 10.0.0.0/8>网关'
-    $lblTip.Location = New-Object System.Drawing.Point(14, 80); $lblTip.Size = New-Object System.Drawing.Size(950, 38)
+                   "「网卡名称/匹配(支持*)」列除了网卡名（如「以太网」），也可以填硬件描述或 MAC 地址（如 B0-25-AA-6F-36-44）；`n" +
+                   '填硬件描述或 MAC 的好处：以后在系统里给网卡改名也不会失效。支持 * 通配（全部网卡）与 以太网* 这类模糊匹配；网关可写为 192.168.1.1:10 指定跃点数，多个网关或 DNS 用分号隔开；附加路由写法 10.0.0.0/8>网关'
+    $lblTip.Location = New-Object System.Drawing.Point(14, 78); $lblTip.Size = New-Object System.Drawing.Size(950, 48)
     $lblTip.ForeColor = [System.Drawing.Color]::DimGray
 
     # 表格
@@ -1730,8 +1949,8 @@ function Show-ProfileEditor {
     }
 
     $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Location = New-Object System.Drawing.Point(14, 122)
-    $grid.Size = New-Object System.Drawing.Size(980, 384)
+    $grid.Location = New-Object System.Drawing.Point(14, 130)
+    $grid.Size = New-Object System.Drawing.Size(980, 376)
     $grid.Anchor = 'Top, Bottom, Left, Right'
     $grid.AllowUserToAddRows = $false
     $grid.AllowUserToDeleteRows = $false
@@ -1796,7 +2015,7 @@ function Show-ProfileEditor {
     # 表格为空时盖一层提示，明确告诉用户「IP 要填在哪」，避免面对空白表格无从下手
     $lblEmpty = New-Object System.Windows.Forms.Label
     $lblEmpty.Text = "表格还是空的`n`n请点上方「+ 添加网卡行」加入一行，`n再双击单元格填写 IP / 掩码 / 网关 / DNS"
-    $lblEmpty.Location = New-Object System.Drawing.Point(24, 128)
+    $lblEmpty.Location = New-Object System.Drawing.Point(24, 136)
     $lblEmpty.Size = New-Object System.Drawing.Size(960, 130)
     $lblEmpty.TextAlign = 'MiddleCenter'
     $lblEmpty.Font = New-FormFont 11
@@ -2667,11 +2886,29 @@ function Show-MainForm {
         $target = Get-ProfileByName $name
         $impact = Get-ProfileImpact $target
         if ($impact.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "配置集「$name」没有匹配到任何可操作的网卡，已中止。`n`n可能原因：`n  1) 配置集里的网卡条目全部处于「停用」状态；`n  2) 网卡匹配名写错，本机不存在同名网卡；`n  3) 目标网卡被虚拟网卡排除规则挡掉了（可在主界面左下角勾选「包含虚拟网卡」后再试）。",
-                '无法应用', 'OK', 'Warning') | Out-Null
-            Write-NSLog "配置集「$name」匹配到 0 块网卡，已中止应用。" 'WARN'
-            return
+            Write-NSLog "配置集「$name」匹配到 0 块网卡。" 'WARN'
+            $rebind = [System.Windows.Forms.MessageBox]::Show(
+                "配置集「$name」没有匹配到任何网卡。可能是网卡在系统里被改过名。`n`n是否现在重新绑定到本机的一块网卡？",
+                '未匹配到网卡', 'YesNo', 'Question')
+            if ($rebind -ne 'Yes') {
+                Write-NSLog '已取消切换。' 'INFO'
+                return
+            }
+            if (-not (Show-AdapterRebindDialog -Profile $target)) {
+                Write-NSLog '未重新绑定网卡，已取消切换。' 'WARN'
+                return
+            }
+            # 重绑成功后配置已落盘：重新载入配置、重算命中范围，让这一次点击直接走完「重绑 + 应用」
+            [void](Import-ConfigFile -Path $script:ConfigFile)
+            $target = Get-ProfileByName $name
+            $impact = Get-ProfileImpact $target
+            if ($impact.Count -eq 0) {
+                Write-NSLog "重新绑定后配置集「$name」仍未匹配到任何网卡，已中止应用。" 'WARN'
+                [System.Windows.Forms.MessageBox]::Show(
+                    "配置集「$name」没有匹配到任何可操作的网卡，已中止。`n`n可能原因：`n  1) 配置集里的网卡条目全部处于「停用」状态；`n  2) 网卡匹配名写错，本机不存在同名网卡；`n  3) 目标网卡被虚拟网卡排除规则挡掉了（可在主界面左下角勾选「包含虚拟网卡」后再试）。",
+                    '无法应用', 'OK', 'Warning') | Out-Null
+                return
+            }
         }
 
         $confirm = [System.Windows.Forms.MessageBox]::Show(
@@ -2707,10 +2944,28 @@ function Show-MainForm {
         $impact = Get-ProfileImpact $target
         if ($impact.Count -eq 0) {
             Write-NSLog "预览结果：「$name」没有匹配到任何网卡。" 'WARN'
-            [System.Windows.Forms.MessageBox]::Show(
-                "配置集「$name」没有匹配到任何可操作的网卡。`n`n请检查网卡匹配名，或在主界面左下角勾选「包含虚拟网卡」。",
-                '预览结果', 'OK', 'Warning') | Out-Null
-            return
+            $rebind = [System.Windows.Forms.MessageBox]::Show(
+                "配置集「$name」没有匹配到任何网卡。可能是网卡在系统里被改过名。`n`n是否现在重新绑定到本机的一块网卡？",
+                '未匹配到网卡', 'YesNo', 'Question')
+            if ($rebind -eq 'Yes') {
+                # 预览只是重绑后重算一次命中范围，本身不做任何网络修改
+                if (Show-AdapterRebindDialog -Profile $target) {
+                    [void](Import-ConfigFile -Path $script:ConfigFile)
+                    $target = Get-ProfileByName $name
+                    if ($null -eq $target) {
+                        Write-NSLog "重新载入配置后找不到配置集「$name」，无法预览。" 'ERROR'
+                        return
+                    }
+                    [void](Invoke-Profile -ProfileName $name -DryRun)
+                    $impact = Get-ProfileImpact $target
+                }
+            }
+            if ($impact.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "配置集「$name」没有匹配到任何可操作的网卡。`n`n请检查网卡匹配名，或在主界面左下角勾选「包含虚拟网卡」。",
+                    '预览结果', 'OK', 'Warning') | Out-Null
+                return
+            }
         }
 
         Write-NSLog "预览结果：「$name」将影响 $($impact.Count) 块网卡。" 'OK'
