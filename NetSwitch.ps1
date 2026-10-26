@@ -892,6 +892,58 @@ function Find-MatchedAdapters {
     return @()
 }
 
+# ============================== 存储用 MAC、显示用名称 ==============================
+#
+# 设计取舍：网卡名称可以在 Windows 里随便改，MAC 不会。
+# 所以配置集里一律存 MAC（保证改名后仍能识别），但界面上一律显示网卡名（保证人看得懂）。
+# 用户在编辑器里照常填「以太网」，保存时自动换成该网卡的 MAC；
+# 读回来显示时再把 MAC 翻译回当前网卡名 —— 改了名就显示新名字，而匹配依旧成立。
+
+# 显示用：把配置集里存的稳定标识（MAC / GUID）翻译成当前网卡名称，方便人看。
+# 查不到对应网卡时原样返回，绝不丢信息。
+function Get-AdapterDisplayText {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $text = $Value.Trim()
+
+    # 只需翻译 MAC 形态与 GUID 形态；普通名称和通配符原样返回，避免多余开销
+    $macKey = ConvertTo-MacKey $text
+    $isMac  = ($macKey.Length -ge 6) -and ($text -match '^[0-9A-Fa-f:.\-]+$')
+    $isGuid = ($text -match '^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-')
+    if (-not $isMac -and -not $isGuid) { return $text }
+
+    foreach ($adapter in (Get-AdapterList)) {
+        if ($isMac -and (ConvertTo-MacKey ([string]$adapter.MacAddress)) -eq $macKey) {
+            return [string]$adapter.Name
+        }
+        if ($isGuid -and (ConvertTo-GuidKey ([string]$adapter.InterfaceGuid)) -eq (ConvertTo-GuidKey $text)) {
+            return [string]$adapter.Name
+        }
+    }
+    return $text
+}
+
+# 存储用：把用户填的网卡名归一化成该网卡的 MAC。
+# 仅当「唯一匹配一块网卡」时才转换 —— 通配符（* / 以太网*）、匹配到多块、匹配不到，
+# 都保持原样，避免悄悄改变通配语义或把无效值吞掉。
+function ConvertTo-AdapterStorageValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $text = $Value.Trim()
+
+    # 含通配符的一律不转换
+    if ($text -eq '*' -or $text.Contains('*') -or $text.Contains('?')) { return $text }
+
+    $matched = @(Find-MatchedAdapters $text)
+    if ($matched.Count -ne 1) { return $text }
+
+    $mac = [string]$matched[0].MacAddress
+    if ([string]::IsNullOrWhiteSpace($mac)) { return $text }
+    return $mac
+}
+
 # ============================== 核心：切换引擎 ==============================
 
 # ---------- 附加路由应用记录 ----------
@@ -1446,7 +1498,7 @@ function Invoke-Cli {
             if ($item.remark) { Write-Host "    $($item.remark)" -ForegroundColor DarkGray } else { Write-Host '' }
             foreach ($ad in (ConvertTo-Array $item.adapters)) {
                 $modeText = if ($ad.mode -eq 'dhcp') { 'DHCP' } else { "$($ad.ip) mask:$($ad.mask) gw:$($ad.gateways -join ',')" }
-                $line = "      [$($ad.adapter)] $modeText"
+                $line = "      [$(Get-AdapterDisplayText ([string]$ad.adapter))] $modeText"
                 Write-Host $line -ForegroundColor Gray
             }
         }
@@ -1598,7 +1650,7 @@ function Get-ProfileSummaryText {
 
     foreach ($ad in $adapters) {
         $flag = if ($ad.enabled) { '启用' } else { '停用' }
-        [void]$builder.AppendLine("[匹配网卡] $($ad.adapter)    $flag")
+        [void]$builder.AppendLine("[匹配网卡] $(Get-AdapterDisplayText ([string]$ad.adapter))    $flag")
         if ($ad.mode -eq 'dhcp') {
             [void]$builder.AppendLine('    获取方式: DHCP 自动获取')
             $dns = ConvertTo-StringList $ad.dns
@@ -1746,7 +1798,7 @@ function Show-AdapterRebindDialog {
         $lstEntries.Size = New-Object System.Drawing.Size(480, 76)
         $lstEntries.Font = New-MonoFont 9
         foreach ($entry in $entries) {
-            [void]$lstEntries.Items.Add([string]$entry.adapter)
+            [void]$lstEntries.Items.Add((Get-AdapterDisplayText ([string]$entry.adapter)))
         }
         if ($lstEntries.Items.Count -gt 0) { $lstEntries.SelectedIndex = 0 }
 
@@ -1764,22 +1816,12 @@ function Show-AdapterRebindDialog {
         }
         if ($lstAdapters.Items.Count -gt 0) { $lstAdapters.SelectedIndex = 0 }
 
+        # 一律按 MAC 记录（MAC 不随系统改名变化），界面上仍显示网卡名称，所以不再提供选项
         $lblMode = New-Object System.Windows.Forms.Label
-        $lblMode.Text = '绑定方式：'
+        $lblMode.Text = '绑定方式：按 MAC 地址记录（界面仍显示网卡名称，以后在系统里改名也不会失效）'
         $lblMode.Location = New-Object System.Drawing.Point(12, 296)
-        $lblMode.Size = New-Object System.Drawing.Size(70, 20)
-
-        $rbName = New-Object System.Windows.Forms.RadioButton
-        $rbName.Text = '按网卡名称'
-        $rbName.Location = New-Object System.Drawing.Point(84, 292)
-        $rbName.Size = New-Object System.Drawing.Size(150, 24)
-        $rbName.Checked = $false
-
-        $rbMac = New-Object System.Windows.Forms.RadioButton
-        $rbMac.Text = '按 MAC 地址（推荐：以后改名也不会失效）'
-        $rbMac.Location = New-Object System.Drawing.Point(236, 292)
-        $rbMac.Size = New-Object System.Drawing.Size(256, 24)
-        $rbMac.Checked = $true
+        $lblMode.Size = New-Object System.Drawing.Size(480, 20)
+        $lblMode.ForeColor = [System.Drawing.Color]::FromArgb(110, 122, 140)
 
         $btnBind = New-Object System.Windows.Forms.Button
         $btnBind.Text = '绑定'
@@ -1812,11 +1854,11 @@ function Show-AdapterRebindDialog {
                 $entry = $entries[$lstEntries.SelectedIndex]
                 $nic   = $adapters[$lstAdapters.SelectedIndex]
 
-                $useMac   = [bool]$rbMac.Checked
-                $newValue = if ($useMac) { [string]$nic.MacAddress } else { [string]$nic.Name }
+                # 存 MAC、显名称：日志里也用名称，方便核对
+                $newValue = [string]$nic.MacAddress
                 if ([string]::IsNullOrWhiteSpace($newValue)) { $newValue = [string]$nic.Name }
-                $oldValue = [string]$entry.adapter
-                $how      = if ($useMac) { 'MAC 地址' } else { '网卡名称' }
+                $oldText = Get-AdapterDisplayText ([string]$entry.adapter)
+                $newText = Get-AdapterDisplayText $newValue
 
                 if ($entry.PSObject.Properties.Name -contains 'adapter') {
                     $entry.adapter = $newValue
@@ -1825,7 +1867,7 @@ function Show-AdapterRebindDialog {
                 }
 
                 Save-ConfigFile | Out-Null
-                Write-NSLog "配置集「$profileName」已重新绑定网卡条目：「$oldValue」→「$newValue」（按 $how）。" 'OK'
+                Write-NSLog "配置集「$profileName」已重新绑定网卡条目：「$oldText」→「$newText」（按 MAC 地址记录）。" 'OK'
 
                 $form.DialogResult = 'OK'
                 $form.Close()
@@ -1841,7 +1883,7 @@ function Show-AdapterRebindDialog {
             $form.Close()
         })
 
-        $form.Controls.AddRange(@($lblEntries, $lstEntries, $lblAdapters, $lstAdapters, $lblMode, $rbName, $rbMac, $btnBind, $btnCancel))
+        $form.Controls.AddRange(@($lblEntries, $lstEntries, $lblAdapters, $lstAdapters, $lblMode, $btnBind, $btnCancel))
 
         $result = $form.ShowDialog()
         return ($result -eq [System.Windows.Forms.DialogResult]::OK)
@@ -1912,8 +1954,8 @@ function Show-ProfileEditor {
 
     $lblTip = New-Object System.Windows.Forms.Label
     $lblTip.Text = "填写方式：在下方表格里双击单元格，直接输入 IP / 子网掩码 / 网关 / DNS；最左侧「启用」列打勾表示该行生效。`n" +
-                   "「网卡名称/匹配(支持*)」列除了网卡名（如「以太网」），也可以填硬件描述或 MAC 地址（如 B0-25-AA-6F-36-44）；`n" +
-                   '填硬件描述或 MAC 的好处：以后在系统里给网卡改名也不会失效。支持 * 通配（全部网卡）与 以太网* 这类模糊匹配；网关可写为 192.168.1.1:10 指定跃点数，多个网关或 DNS 用分号隔开；附加路由写法 10.0.0.0/8>网关'
+                   '「网卡名称/匹配」列照常填网卡名即可（如「以太网」）：程序会自动按 MAC 地址记住这块网卡，界面上仍显示名称，' +
+                   '以后在系统里给网卡改名也不会失效。也可用 *（全部网卡）或 以太网* 这类模糊匹配；网关可写为 192.168.1.1:10 指定跃点数，多个网关或 DNS 用分号隔开；附加路由写法 10.0.0.0/8>网关'
     $lblTip.Location = New-Object System.Drawing.Point(14, 78); $lblTip.Size = New-Object System.Drawing.Size(950, 48)
     $lblTip.ForeColor = [System.Drawing.Color]::DimGray
 
@@ -1936,7 +1978,7 @@ function Show-ProfileEditor {
         foreach ($ad in (ConvertTo-Array $SourceProfile.adapters)) {
             $row = $table.NewRow()
             $row['Enabled']  = [bool]$ad.enabled
-            $row['Adapter']  = [string]$ad.adapter
+            $row['Adapter']  = Get-AdapterDisplayText ([string]$ad.adapter)
             $row['Mode']     = if ($ad.mode -eq 'dhcp') { 'DHCP自动' } else { '静态IP' }
             $row['IP']       = [string]$ad.ip
             $row['Mask']     = [string]$ad.mask
@@ -2134,7 +2176,8 @@ function Show-ProfileEditor {
             $dnsArray = @(Split-ItemList $dnsText)
 
             $adapterList += [pscustomobject][ordered]@{
-                adapter  = $adapterName.Trim()
+                # 存 MAC：用户填的是网卡名，这里换成该网卡的 MAC，以后改名也不会失效
+                adapter  = ConvertTo-AdapterStorageValue $adapterName
                 enabled  = [bool]$row['Enabled']
                 mode     = if ($modeText -eq 'DHCP自动') { 'dhcp' } else { 'static' }
                 ip       = ([string]$row['IP']).Trim()
