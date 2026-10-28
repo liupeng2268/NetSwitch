@@ -1740,8 +1740,9 @@ NetSwitch $script:Version - 用法提示
 #   1) 在「任何窗口被创建之前」声明本进程为高 DPI 感知 —— 系统不再拉伸，改由程序按真实 DPI 渲染；
 #   2) 再把所有控件的坐标、尺寸、行高按同一个倍数放大，把视觉尺寸补回来。
 #
-# 【如何关闭】把下面这一行改成 $false，即可完全回到改造前的行为（窗口交给系统拉伸）：
-$script:EnableDpiAwareness = $true
+# 默认关闭：开启后文字变清晰，但布局要依赖这台机器的真实 DPI，开发机上没法验证，
+# 所以需要你实际跑一次确认；确认没问题再把这一行改成 $true。
+$script:EnableDpiAwareness = $false
 
 # 所有坐标与字体的统一放大倍数。100% 缩放下恒为 1，等价于不做任何缩放。
 $script:UiScale = 1.0
@@ -1767,12 +1768,31 @@ public static extern bool SetProcessDPIAware();
 # 让界面在启动时先把自己「放大」到与系统拉伸后一致的视觉尺寸。
 # 只放大坐标与尺寸，绝不碰字体 —— 字号由 New-FormFont / New-MonoFont 统一乘 UiScale，
 # 两边各管一头，才不会重复放大。
+# 摊平控件树：清空每个控件的锚点并记下原值，同时把子控件一起收进来。
+# 必须「先全部清空、再统一放大」，不能边遍历边放大 —— 只要放大过程中锚点还在，
+# 父容器尺寸一变，WinForms 就会再调整一次子控件，等于放大了两倍。
+function Invoke-UiCollectControls {
+    param($Root)
+    foreach ($c in $Root.Controls) {
+        [void]$script:UiScaleControls.Add($c)
+        [void]$script:UiScaleAnchors.Add($c.Anchor)
+        $c.Anchor = [System.Windows.Forms.AnchorStyles]::None
+        if ($c.HasChildren) { Invoke-UiCollectControls -Root $c }
+    }
+}
+
 function Invoke-UiScaleLayout {
     param($Root, [double]$Factor)
 
     if ($null -eq $Root -or $Factor -le 1.0) { return }
 
-    foreach ($c in $Root.Controls) {
+    # 第一遍：摊平并摘掉锚点
+    $script:UiScaleControls = New-Object System.Collections.ArrayList
+    $script:UiScaleAnchors  = New-Object System.Collections.ArrayList
+    Invoke-UiCollectControls -Root $Root
+
+    # 第二遍：统一放大坐标与尺寸
+    foreach ($c in $script:UiScaleControls) {
         $c.Location = New-Object System.Drawing.Point(
             [int][math]::Round($c.Location.X * $Factor),
             [int][math]::Round($c.Location.Y * $Factor))
@@ -1788,12 +1808,9 @@ function Invoke-UiScaleLayout {
             $c.ColumnHeadersHeight = [int][math]::Round($c.ColumnHeadersHeight * $Factor)
         }
 
-        # 字体不在这里动：所有字号都由 New-FormFont / New-MonoFont 统一乘 UiScale，
-        # 布局只负责坐标与尺寸，避免两边各放大一次。
-        if ($c.HasChildren) { Invoke-UiScaleLayout -Root $c -Factor $Factor }
     }
 
-    # 窗体放到最后放大：先放大会触发锚点布局，子控件随后再手工放大就会被放大两次。
+    # 窗体放到最后放大：此时所有子控件的锚点都还是 None，不会被锚点再调整一次
     if ($Root -is [System.Windows.Forms.Form]) {
         $Root.Size = New-Object System.Drawing.Size(
             [int][math]::Round($Root.Size.Width * $Factor),
@@ -1803,6 +1820,11 @@ function Invoke-UiScaleLayout {
                 [int][math]::Round($Root.MinimumSize.Width * $Factor),
                 [int][math]::Round($Root.MinimumSize.Height * $Factor))
         }
+    }
+
+    # 锚点装回去，之后用户手动拉窗口仍然按原设计自动伸缩
+    for ($i = 0; $i -lt $script:UiScaleControls.Count; $i++) {
+        $script:UiScaleControls[$i].Anchor = $script:UiScaleAnchors[$i]
     }
 }
 
