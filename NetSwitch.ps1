@@ -30,7 +30,9 @@ param(
     [string]$ExportFile,     # 导出配置文件
     [switch]$Silent,         # 静默模式（少输出）
     [string]$ConfigPath,     # 指定配置文件路径
-    [switch]$Elevated        # 内部标记：已经过 UAC 提权，避免循环提权
+    [switch]$Elevated,       # 内部标记：已经过 UAC 提权，避免循环提权
+    [string]$DpiMode,        # 诊断用：on / off 临时覆盖高 DPI 开关，不落盘
+    [string]$DumpLayout      # 诊断用：把主界面的控件坐标尺寸导出到指定文件
 )
 
 # ============================== 全局初始化 ==============================
@@ -50,6 +52,17 @@ $script:ScriptArgs = @{}
 foreach ($scriptArgKey in $PSBoundParameters.Keys) {
     $script:ScriptArgs[$scriptArgKey] = $PSBoundParameters[$scriptArgKey]
 }
+
+# 诊断用：-DpiMode on|off 只在本次进程内临时覆盖高 DPI 开关，不改动脚本文件本身。
+# 用途是比较「开启 / 关闭」两种设置下的实际界面，排查高 DPI 布局问题。
+$script:DpiModeOverride = ''
+if ($PSBoundParameters.ContainsKey('DpiMode')) {
+    $script:DpiModeOverride = ([string]$DpiMode).Trim().ToLowerInvariant()
+}
+
+# 诊断用：-DumpLayout <文件路径> 会在主界面显示后把控件坐标尺寸写入该文件
+$script:DumpLayoutPath = ''
+if ($PSBoundParameters.ContainsKey('DumpLayout')) { $script:DumpLayoutPath = [string]$DumpLayout }
 
 # ====================== 网卡安全过滤（防止误伤虚拟网卡） ======================
 # 背景：医院机器上通常同时存在 VMware / VirtualBox / Hyper-V 虚拟网卡、蓝牙网卡、
@@ -1740,9 +1753,13 @@ NetSwitch $script:Version - 用法提示
 #   1) 在「任何窗口被创建之前」声明本进程为高 DPI 感知 —— 系统不再拉伸，改由程序按真实 DPI 渲染；
 #   2) 再把所有控件的坐标、尺寸、行高按同一个倍数放大，把视觉尺寸补回来。
 #
-# 开启后文字按真实 DPI 渲染、不再发虚，布局交给 WinForms 按 DPI 自动缩放。
-# 试验阶段：若界面出现偏移或溢出，把这一行改成 $false 即回到系统拉伸的旧行为。
+# 开启后文字按真实 DPI 渲染、不再发虚；布局同步按下述缩放逻辑处理。
+# 若界面出现偏移或溢出，把这一行改成 $false 即回到系统拉伸的旧行为。
 $script:EnableDpiAwareness = $false
+
+# 命令行 -DpiMode on|off 可临时覆盖上面的设置，仅用于诊断对比，不写回文件
+if ($script:DpiModeOverride -eq 'on')  { $script:EnableDpiAwareness = $true }
+if ($script:DpiModeOverride -eq 'off') { $script:EnableDpiAwareness = $false }
 
 # 所有坐标与字体的统一放大倍数。100% 缩放下恒为 1，等价于不做任何缩放。
 $script:UiScale = 1.0
@@ -2163,6 +2180,47 @@ function ConvertTo-UiCard {
     $parent.Controls.Remove($GroupBox)
     $GroupBox.Dispose()
     return $card
+}
+
+# 诊断用：把窗体及全部后代的坐标、尺寸、字体、锚点导出成文本，
+# 并标出「超出父容器」的控件，用于定位高 DPI 下的布局问题。
+# 用 ArrayList 而不是普通数组：递归脚本块在子作用域执行，普通数组的 += 看不到。
+function Write-UiLayoutDump {
+    param($Form, [string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if ($null -eq $Form) { return }
+
+    $lines = New-Object System.Collections.ArrayList
+    [void]$lines.Add("FORM       client=$($Form.ClientSize.Width)x$($Form.ClientSize.Height)  size=$($Form.Size.Width)x$($Form.Size.Height)  autoscale=$($Form.AutoScaleMode)  dims=$($Form.AutoScaleDimensions)")
+    [void]$lines.Add("UiScale    = $script:UiScale")
+    [void]$lines.Add("DpiMode    = '$script:DpiModeOverride'   EnableDpiAwareness = $script:EnableDpiAwareness")
+    [void]$lines.Add('')
+
+    $walk = {
+        param($Parent, [int]$Depth)
+        $pad = ' ' * ($Depth * 2)
+        foreach ($c in $Parent.Controls) {
+            $overflow = ''
+            if ($c.Left -lt 0 -or $c.Top -lt 0 -or
+                $c.Right -gt $Parent.ClientSize.Width -or
+                $c.Bottom -gt $Parent.ClientSize.Height) { $overflow = '   <<< OVERFLOW' }
+
+            $text = ''
+            try { $text = [string]$c.Text } catch { }
+            $text = $text -replace "`r", ' ' -replace "`n", ' '
+            if ($text.Length -gt 18) { $text = $text.Substring(0, 18) + '...' }
+
+            [void]$lines.Add(('{0}{1} l={2} t={3} w={4} h={5} font={6} anchor={7} "{8}"{9}' -f `
+                $pad, $c.GetType().Name, $c.Left, $c.Top, $c.Width, $c.Height, `
+                $c.Font.Size, $c.Anchor, $text, $overflow))
+
+            if ($c.HasChildren) { & $walk $c ($Depth + 1) }
+        }
+    }
+    & $walk $Form 0
+
+    ($lines -join "`r`n") | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
 # 打开控件的双缓冲。Control.SetStyle / DoubleBuffered 都是 protected 成员，
@@ -3792,6 +3850,10 @@ function Show-MainForm {
         & $refreshStatus
         # 界面稳住之后，把双击 .bat 时挂在后面的黑窗口收掉
         Hide-ConsoleWindow
+        # 诊断用：把布局坐标导出，便于排查高 DPI 下的错位
+        if ($script:DumpLayoutPath) {
+            try { Write-UiLayoutDump -Form $form -Path $script:DumpLayoutPath } catch { }
+        }
     })
     [void]$form.ShowDialog()
 }
