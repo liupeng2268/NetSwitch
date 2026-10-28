@@ -1419,7 +1419,99 @@ function Show-CliMessageBox {
     }
 }
 
+# 读取当前网络状态（主界面右上「当前网络状态」与命令行 -ShowStatus 共用）。
+#
+# 这里刻意绕开 Get-NetIPAddress / Get-NetIPInterface / Get-DnsClientServerAddress /
+# Get-NetRoute 这四个 cmdlet：它们各自要加载一个 CDXML 模块，冷启动时四个模块合计约 7 秒，
+# 而且是「每块网卡各调一遍」，网卡越多耗时越长。
+# 改成对 WMI 各查一次全量数据、再在内存里按 InterfaceIndex 配对：
+# 冷启动约 1 秒，且耗时不再随网卡数量线性增长。
+# 万一 WMI 不可用（极少数精简/受限系统），自动退回原来的 cmdlet 实现，不影响可用性。
 function Get-StatusText {
+    try {
+        return (Get-StatusTextViaCim)
+    } catch {
+        Write-NSLog "WMI 读取网络状态失败，已改用网卡 PowerShell 模块：$($_.Exception.Message)" 'WARN'
+        return (Get-StatusTextViaCmdlet)
+    }
+}
+
+function Get-StatusTextViaCim {
+    $builder = New-Object System.Text.StringBuilder
+
+    $cfgs = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = True' -ErrorAction Stop |
+              Sort-Object { [int]$_.Index })
+    if ($cfgs.Count -eq 0) {
+        [void]$builder.AppendLine('没有找到已启用且已连接网络的网卡。')
+        return $builder.ToString()
+    }
+
+    $nics = @(Get-CimInstance -ClassName Win32_NetworkAdapter -ErrorAction Stop)
+    $nicMap = @{}
+    foreach ($n in $nics) { $nicMap[[string]$n.DeviceID] = $n }
+
+    foreach ($c in $cfgs) {
+        $nic = $nicMap[[string]$c.Index]
+
+        # 与主界面的网卡列表共用同一套虚拟网卡过滤规则，
+        # 否则会出现「列表里没有、状态里却有」的不一致。
+        $probe = [pscustomobject]@{
+            Name                 = $(if ($null -ne $nic) { [string]$nic.NetConnectionID } else { [string]$c.Description })
+            InterfaceDescription = [string]$c.Description
+        }
+        if (Test-VirtualAdapter $probe) { continue }
+
+        $name = [string]$probe.Name
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$c.Description }
+
+        $statusText = ConvertFrom-ConnectionStatus $nic
+        $speedText  = ConvertFrom-AdapterSpeed $nic
+
+        # WMI 的 MAC 用冒号分隔，这里统一成连字符，与配置集里存的写法一致
+        $mac = ([string]$c.MACAddress) -replace ':', '-'
+
+        [void]$builder.AppendLine("■ $name   [$statusText]  $speedText")
+        [void]$builder.AppendLine("    MAC        : $mac")
+        [void]$builder.AppendLine("    获取方式   : $(if ([bool]$c.DHCPEnabled) { 'DHCP' } else { '静态' })")
+
+        # IPAddress 与 IPSubnet 是两个一一对应的数组，里面混着 IPv6，
+        # 因此按下标配对，只保留 IPv4 那几组
+        $rawIps   = @($c.IPAddress)
+        $rawMasks = @($c.IPSubnet)
+        $ipv4     = @()
+        for ($i = 0; $i -lt $rawIps.Count; $i++) {
+            if ([string]$rawIps[$i] -notmatch '^\d+\.\d+\.\d+\.\d+$') { continue }
+            $mask = ''
+            if ($i -lt $rawMasks.Count) { $mask = [string]$rawMasks[$i] }
+            if ([string]::IsNullOrWhiteSpace($mask)) { $mask = '255.255.255.0' }
+            $ipv4 += [pscustomobject]@{ IP = [string]$rawIps[$i]; Mask = $mask }
+        }
+
+        if ($ipv4.Count -eq 0) {
+            [void]$builder.AppendLine('    IPv4       : （无）')
+        } else {
+            foreach ($item in $ipv4) {
+                $prefix = ConvertFrom-MaskToPrefix $item.Mask
+                [void]$builder.AppendLine("    IPv4       : $($item.IP)/$prefix  ($($item.Mask))")
+            }
+        }
+
+        $gateways = @($c.DefaultIPGateway   | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })
+        $dnsList  = @($c.DNSServerSearchOrder | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })
+
+        $gwText  = if ($gateways.Count -gt 0) { $gateways -join ', ' } else { '（无）' }
+        $dnsText = if ($dnsList.Count  -gt 0) { $dnsList  -join ', ' } else { '（自动/无）' }
+
+        [void]$builder.AppendLine("    网关       : $gwText")
+        [void]$builder.AppendLine("    DNS        : $dnsText")
+        [void]$builder.AppendLine('')
+    }
+
+    return $builder.ToString()
+}
+
+# 原来的实现：逐块网卡调四个 cmdlet。保留作为 WMI 不可用时的退路。
+function Get-StatusTextViaCmdlet {
     $builder = New-Object System.Text.StringBuilder
     $adapters = Get-AdapterList
 
@@ -1456,6 +1548,62 @@ function Get-StatusText {
     }
 
     return $builder.ToString()
+}
+
+# WMI 的 NetConnectionStatus 是数字，翻成中文显示
+function ConvertFrom-ConnectionStatus {
+    param($Nic)
+    if ($null -eq $Nic) { return '未知' }
+    $code = 0
+    try { $code = [int]$Nic.NetConnectionStatus } catch { return '未知' }
+    switch ($code) {
+        0      { return '已断开' }
+        1      { return '正在连接' }
+        2      { return '已连接' }
+        3      { return '正在断开' }
+        4      { return '硬件不存在' }
+        5      { return '已禁用' }
+        6      { return '硬件故障' }
+        7      { return '网线已拔出' }
+        8      { return '正在验证身份' }
+        9      { return '身份验证成功' }
+        10     { return '身份验证失败' }
+        11     { return '地址无效' }
+        12     { return '需要凭据' }
+        default { return "状态 $code" }
+    }
+}
+
+# WMI 的 Speed 单位是 bps（字符串），翻成 Gbps / Mbps
+function ConvertFrom-AdapterSpeed {
+    param($Nic)
+    if ($null -eq $Nic) { return '' }
+    $bps = 0
+    try { $bps = [double]$Nic.Speed } catch { return '' }
+    if ($bps -le 0) { return '' }
+    # 与 Get-NetAdapter 的 LinkSpeed 保持同样的写法：1 Gbps / 866.7 Mbps
+    if ($bps -ge 1000000000) {
+        return ([math]::Round(($bps / 1000000000), 1).ToString() + ' Gbps')
+    }
+    return ([math]::Round(($bps / 1000000), 1).ToString() + ' Mbps')
+}
+
+# 掩码 -> 前缀长度（WMI 只给掩码，界面上要显示成 192.168.1.10/24 这种形式）
+function ConvertFrom-MaskToPrefix {
+    param([string]$Mask)
+    if ([string]::IsNullOrWhiteSpace($Mask)) { return 24 }
+    if ($Mask -notmatch '^\d+\.\d+\.\d+\.\d+$') { return 24 }
+    $prefix = 0
+    foreach ($part in $Mask.Split('.')) {
+        $value = 0
+        [void][int]::TryParse($part, [ref]$value)
+        while ($value -gt 0) {
+            $prefix += ($value -band 1)
+            $value = $value -shr 1
+        }
+    }
+    if ($prefix -lt 0 -or $prefix -gt 32) { return 24 }
+    return $prefix
 }
 
 function ConvertFrom-PrefixToMask {
@@ -1584,18 +1732,156 @@ NetSwitch $script:Version - 用法提示
 
 # ============================== 图形界面 ==============================
 
+# ====================== 高 DPI 与控制台窗口 ======================
+# 背景：脚本没有 manifest，默认不声明 DPI 感知。Windows 在 125% / 150% 缩放下会把整个
+#       窗口当成一张位图放大后显示，表现就是「文字发虚、描边发毛」，放大倍数越大越明显。
+#
+# 修法分两步，必须成对出现，否则界面会整体变大或变小：
+#   1) 在「任何窗口被创建之前」声明本进程为高 DPI 感知 —— 系统不再拉伸，改由程序按真实 DPI 渲染；
+#   2) 再把所有控件的坐标、尺寸、行高按同一个倍数放大，把视觉尺寸补回来。
+#
+# 【如何关闭】把下面这一行改成 $false，即可完全回到改造前的行为（窗口交给系统拉伸）：
+$script:EnableDpiAwareness = $true
+
+# 所有坐标与字体的统一放大倍数。100% 缩放下恒为 1，等价于不做任何缩放。
+$script:UiScale = 1.0
+
+# 声明高 DPI 感知。必须在创建任何窗口之前调用，且每个进程只能成功设置一次，
+# 所以失败（比如在已感知的宿主里运行）一律静默降级，绝不让异常冒出去。
+function Enable-ProcessDpiAwareness {
+    if (-not $script:EnableDpiAwareness) { return $false }
+    try {
+        Add-Type -Namespace 'NSUi' -Name 'Dpi' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool SetProcessDpiAwarenessContext(int value);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool SetProcessDPIAware();
+'@
+        # -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2（Win10 1703+ / Win11）
+        try { if ([NSUi.Dpi]::SetProcessDpiAwarenessContext(-4)) { return $true } } catch { }
+        try { return [NSUi.Dpi]::SetProcessDPIAware() } catch { }
+    } catch { }
+    return $false
+}
+
+# 让界面在启动时先把自己「放大」到与系统拉伸后一致的视觉尺寸。
+# 只放大坐标与尺寸，绝不碰字体 —— 字号由 New-FormFont / New-MonoFont 统一乘 UiScale，
+# 两边各管一头，才不会重复放大。
+function Invoke-UiScaleLayout {
+    param($Root, [double]$Factor)
+
+    if ($null -eq $Root -or $Factor -le 1.0) { return }
+
+    foreach ($c in $Root.Controls) {
+        $c.Location = New-Object System.Drawing.Point(
+            [int][math]::Round($c.Location.X * $Factor),
+            [int][math]::Round($c.Location.Y * $Factor))
+        $c.Size = New-Object System.Drawing.Size(
+            [int][math]::Round($c.Size.Width * $Factor),
+            [int][math]::Round($c.Size.Height * $Factor))
+
+        if ($c -is [System.Windows.Forms.ListBox]) {
+            $c.ItemHeight = [int][math]::Round($c.ItemHeight * $Factor)
+        }
+        if ($c -is [System.Windows.Forms.DataGridView]) {
+            $c.RowTemplate.Height = [int][math]::Round($c.RowTemplate.Height * $Factor)
+            $c.ColumnHeadersHeight = [int][math]::Round($c.ColumnHeadersHeight * $Factor)
+        }
+
+        # 字体不在这里动：所有字号都由 New-FormFont / New-MonoFont 统一乘 UiScale，
+        # 布局只负责坐标与尺寸，避免两边各放大一次。
+        if ($c.HasChildren) { Invoke-UiScaleLayout -Root $c -Factor $Factor }
+    }
+
+    # 窗体放到最后放大：先放大会触发锚点布局，子控件随后再手工放大就会被放大两次。
+    if ($Root -is [System.Windows.Forms.Form]) {
+        $Root.Size = New-Object System.Drawing.Size(
+            [int][math]::Round($Root.Size.Width * $Factor),
+            [int][math]::Round($Root.Size.Height * $Factor))
+        if ($Root.MinimumSize.Width -gt 0 -and $Root.MinimumSize.Height -gt 0) {
+            $Root.MinimumSize = New-Object System.Drawing.Size(
+                [int][math]::Round($Root.MinimumSize.Width * $Factor),
+                [int][math]::Round($Root.MinimumSize.Height * $Factor))
+        }
+    }
+}
+
+# 双击 .bat 启动时，cmd 那个黑窗口会一直挂在图形界面后面等进程结束。
+# 界面显示出来之后就把它收起来 —— 启动阶段的报错信息仍然打印过，不影响排查。
+#
+# 只在这种情况下收：进程是「由资源管理器或 cmd 直接拉起来的」，也就是用户双击启动的场景。
+# 如果用户是在自己开着的终端里运行本脚本，那个终端是他的，不能动。
+function Hide-ConsoleWindow {
+    if (-not (Test-LaunchedFromShell)) { return }
+    try {
+        Add-Type -Namespace 'NSUi' -Name 'Window' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@
+        $h = [NSUi.Window]::GetConsoleWindow()
+        if ($h -ne [System.IntPtr]::Zero) { [void][NSUi.Window]::ShowWindow($h, 0) }
+    } catch { }
+}
+
+# 开机后立即执行：先声明感知，再算出放大倍数。
+# 关键自检：只有「确实声明成功」时才放大。若声明失败（系统仍会拉伸窗口），
+# 这里绝不能再放大，否则就会被拉伸一次 + 放大一次，界面凭空大一倍。
+# 判断本进程是不是「用户双击启动」的：看父进程是不是资源管理器或 cmd。
+# 结果缓存，避免每次都查。
+$script:LaunchedFromShell = $null
+
+function Test-LaunchedFromShell {
+    if ($null -ne $script:LaunchedFromShell) { return [bool]$script:LaunchedFromShell }
+
+    $result = $false
+    try {
+        $me = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop
+        $parentId = 0
+        try { $parentId = [int]$me.ParentProcessId } catch { $parentId = 0 }
+        if ($parentId -gt 0) {
+            $parent = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentId" -ErrorAction Stop
+            $pn = ([string]$parent.Name).ToLowerInvariant()
+            if ($pn -eq 'explorer.exe' -or $pn -eq 'cmd.exe') { $result = $true }
+        }
+    } catch { }
+
+    $script:LaunchedFromShell = $result
+    return $result
+}
+
+function Initialize-UiScale {
+    $script:UiScale = 1.0
+    if (-not (Enable-ProcessDpiAwareness)) { return }
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $g = [System.Drawing.Graphics]::FromHwnd([System.IntPtr]::Zero)
+        try {
+            $scale = $g.DpiX / 96.0
+            if ($scale -gt 1.0 -and $scale -lt 4.0) { $script:UiScale = $scale }
+        } finally { $g.Dispose() }
+    } catch { }
+}
+
+# 注意：Initialize-UiScale 不在顶层调用。声明感知要编译一小段 C#，有约 1 秒开销，
+# 而命令行模式根本用不到界面，不该为它付这个代价 —— 因此放到图形界面入口处再调用。
+
 function New-FormFont {
     param([single]$Size = 9, [string]$Style = 'Regular')
+    # 字号用「磅」为单位，磅是物理单位，高 DPI 感知下系统会自动换成更多像素，
+    # 视觉大小保持不变。这里乘 UiScale 是为了让字与放大后的控件保持原有比例。
+    $pt = $Size * $script:UiScale
     try {
-        return (New-Object System.Drawing.Font('Microsoft YaHei UI', $Size, [System.Drawing.FontStyle]$Style))
+        return (New-Object System.Drawing.Font('Microsoft YaHei UI', $pt, [System.Drawing.FontStyle]$Style))
     } catch {
-        return (New-Object System.Drawing.Font('Microsoft Sans Serif', $Size, [System.Drawing.FontStyle]$Style))
+        return (New-Object System.Drawing.Font('Microsoft Sans Serif', $pt, [System.Drawing.FontStyle]$Style))
     }
 }
 
 function New-MonoFont {
     param([single]$Size = 9)
-    return (New-Object System.Drawing.Font('Consolas', $Size))
+    return (New-Object System.Drawing.Font('Consolas', ($Size * $script:UiScale)))
 }
 
 # ============================== Win11 风格主题 ==============================
@@ -1650,13 +1936,14 @@ function Get-UiThemeMap {
     return $script:UiTheme
 }
 
-# 圆角矩形路径。半径给的是「圆角半径」，内部按直径 AddArc。
+# 圆角矩形路径。半径给的是 96 DPI 下的「圆角半径」，内部按屏幕缩放倍数换算后再按直径 AddArc。
 function New-UiRoundPath {
     param(
         [System.Drawing.Rectangle]$Rect,
         [int]$Radius = 4
     )
-    $d = $Radius * 2
+    # 控件尺寸已经被 Invoke-UiScaleLayout 放大过，圆角也要同步放大，否则高 DPI 下圆角会显得过尖
+    $d = [int][math]::Round($Radius * $script:UiScale) * 2
     # 半径不能超过短边的一半，否则弧会互相穿插画出畸形路径
     if ($d -gt $Rect.Height) { $d = $Rect.Height }
     if ($d -gt $Rect.Width) { $d = $Rect.Width }
@@ -1829,7 +2116,13 @@ function ConvertTo-UiCard {
             $font = New-FormFont 10 Bold
             $sf = New-Object System.Drawing.StringFormat
             $sf.LineAlignment = 'Center'
-            $rf = New-Object System.Drawing.RectangleF -ArgumentList @(14.0, 5.0, [float]($rect.Width - 28), 22.0)
+            # 标题的边距与高度同样是 96 DPI 下的数值，按缩放倍数换算后才是同一视觉位置
+            $padX = 14.0 * $script:UiScale
+            $padY = 5.0 * $script:UiScale
+            $rf = New-Object System.Drawing.RectangleF -ArgumentList @(
+                [float]$padX, [float]$padY,
+                [float]($rect.Width - ($padX * 2)),
+                [float](22.0 * $script:UiScale))
             $tb = New-Object System.Drawing.SolidBrush $th.Text
             $g.DrawString($titleText, $font, $tb, $rf, $sf)
             $tb.Dispose()
@@ -1937,7 +2230,11 @@ function Invoke-UiTheme {
                     $e.Graphics.FillRectangle($b, $e.Bounds)
                     $b.Dispose()
                     $tb = New-Object System.Drawing.SolidBrush $fore
-                    $rf = New-Object System.Drawing.RectangleF -ArgumentList @([float]($e.Bounds.X + 6), [float]$e.Bounds.Y, [float]($e.Bounds.Width - 8), [float]$e.Bounds.Height)
+                    $rf = New-Object System.Drawing.RectangleF -ArgumentList @(
+                        [float]($e.Bounds.X + (6 * $script:UiScale)),
+                        [float]$e.Bounds.Y,
+                        [float]($e.Bounds.Width - (8 * $script:UiScale)),
+                        [float]$e.Bounds.Height)
                     $e.Graphics.DrawString([string]$sender.Items[$e.Index], $sender.Font, $tb, $rf)
                     $tb.Dispose()
                 })
@@ -1952,6 +2249,12 @@ function Invoke-UiTheme {
         }
 
         if ($c.HasChildren) { Invoke-UiTheme -Root $c }
+    }
+
+    # 只在最外层跑一次：此时所有控件都已建好、GroupBox 也换成卡片了，
+    # 统一按屏幕缩放倍数放大坐标与尺寸，把「系统不再拉伸」丢掉的视觉尺寸补回来。
+    if ($Root -is [System.Windows.Forms.Form]) {
+        Invoke-UiScaleLayout -Root $Root -Factor $script:UiScale
     }
 }
 
@@ -2888,8 +3191,9 @@ function Show-MainForm {
         $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
         # 注意：RectangleF 的每个参数都必须单独加括号，否则 PowerShell 会把逗号解析成
         # 数组构造运算符，进而触发 [System.Object[]] 的 op_Subtraction 异常。切勿去掉括号。
-        $textRect = New-Object System.Drawing.RectangleF(14, ($e.Bounds.Y + 5), ($e.Bounds.Width - 24), 18)
-        $subRect  = New-Object System.Drawing.RectangleF(14, ($e.Bounds.Y + 23), ($e.Bounds.Width - 24), 15)
+        $lineX = 14 * $script:UiScale
+        $textRect = New-Object System.Drawing.RectangleF(([float]$lineX), ([float]($e.Bounds.Y + (5 * $script:UiScale))), ([float]($e.Bounds.Width - (24 * $script:UiScale))), ([float](18 * $script:UiScale)))
+        $subRect  = New-Object System.Drawing.RectangleF(([float]$lineX), ([float]($e.Bounds.Y + (23 * $script:UiScale))), ([float]($e.Bounds.Width - (24 * $script:UiScale))), ([float](15 * $script:UiScale)))
         $g.DrawString($text, $font, $textBrush, $textRect)
         if ($subText) { $g.DrawString($subText, $subFont, $subBrush, $subRect) }
         $subBrush.Dispose()
@@ -3132,9 +3436,11 @@ function Show-MainForm {
     }
 
     & $reloadProfiles
-    & $refreshStatus
     & $updateAdminLabel
     & $updateDetail
+    # 网络状态要查 WMI，冷启动约 1 秒。放在这里先占位，等窗口显示出来再填充，
+    # 免得用户盯着白屏等状态刷新完。
+    $txtStatus.Text = '正在读取网络状态…'
 
     Write-NSLog "界面已就绪：共 $(@($script:ConfigData.profiles).Count) 个配置集。新建/编辑后点「应用此配置集」即可切换网络。" 'OK'
 
@@ -3431,7 +3737,13 @@ function Show-MainForm {
         }
     })
 
-    $form.Add_Shown({ $form.Activate() })
+    $form.Add_Shown({
+        $form.Activate()
+        # 窗口已经画出来了，这时才去读网络状态
+        & $refreshStatus
+        # 界面稳住之后，把双击 .bat 时挂在后面的黑窗口收掉
+        Hide-ConsoleWindow
+    })
     [void]$form.ShowDialog()
 }
 
@@ -3475,6 +3787,9 @@ if ($cliRequested) {
 }
 
 # 图形界面模式
+# 声明高 DPI 感知 + 算出统一放大倍数。必须在 Show-MainForm 之前、任何窗口创建之前完成。
+Initialize-UiScale
+
 if (-not (Test-Path $script:ConfigFile)) {
     $script:ConfigData = Repair-ConfigData (New-DefaultData)
     Save-ConfigFile | Out-Null
