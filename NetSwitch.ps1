@@ -1783,18 +1783,17 @@ public static extern bool SetProcessDPIAware();
 }
 
 # 让界面在启动时先把自己「放大」到与系统拉伸后一致的视觉尺寸。
-# 只放大坐标与尺寸，绝不碰字体 —— 字号由 New-FormFont / New-MonoFont 统一乘 UiScale，
-# 两边各管一头，才不会重复放大。
-# 摊平控件树：清空每个控件的锚点并记下原值，同时把子控件一起收进来。
-# 必须「先全部清空、再统一放大」，不能边遍历边放大 —— 只要放大过程中锚点还在，
-# 父容器尺寸一变，WinForms 就会再调整一次子控件，等于放大了两倍。
-function Invoke-UiCollectControls {
+# 布局交给 Control.Scale 处理，这里只负责把「不该跟着放大」的东西记下来：
+# 字号（磅是物理单位，感知后系统自己会渲染成更多像素）与 ListBox 行高。
+function Invoke-UiCollectMetrics {
     param($Root)
     foreach ($c in $Root.Controls) {
-        [void]$script:UiScaleControls.Add($c)
-        [void]$script:UiScaleAnchors.Add($c.Anchor)
-        $c.Anchor = [System.Windows.Forms.AnchorStyles]::None
-        if ($c.HasChildren) { Invoke-UiCollectControls -Root $c }
+        [void]$script:ScaleBackupControls.Add($c)
+        [void]$script:ScaleBackupSizes.Add($c.Font.Size)
+        $ih = 0
+        if ($c -is [System.Windows.Forms.ListBox]) { $ih = $c.ItemHeight }
+        [void]$script:ScaleBackupItemH.Add($ih)
+        if ($c.HasChildren) { Invoke-UiCollectMetrics -Root $c }
     }
 }
 
@@ -1802,51 +1801,45 @@ function Invoke-UiScaleLayout {
     param($Root, [double]$Factor)
 
     if ($null -eq $Root -or $Factor -le 1.0) { return }
+    if (-not ($Root -is [System.Windows.Forms.Form])) { return }
 
-    # 第一遍：摊平并摘掉锚点
-    $script:UiScaleControls = New-Object System.Collections.ArrayList
-    $script:UiScaleAnchors  = New-Object System.Collections.ArrayList
-    Invoke-UiCollectControls -Root $Root
+    # 先记下每个控件的原始字号与行高。
+    # Control.Scale 会按比例放大布局，也可能连带改字体；而磅是物理单位，
+    # DPI 感知下 9pt 本来就会渲染成 18px，视觉大小不变，所以缩完要还原回去。
+    $script:ScaleBackupControls = New-Object System.Collections.ArrayList
+    $script:ScaleBackupSizes    = New-Object System.Collections.ArrayList
+    $script:ScaleBackupItemH    = New-Object System.Collections.ArrayList
+    Invoke-UiCollectMetrics -Root $Root
 
-    # 第二遍：统一放大坐标与尺寸
-    foreach ($c in $script:UiScaleControls) {
-        $c.Location = New-Object System.Drawing.Point(
-            [int][math]::Round($c.Location.X * $Factor),
-            [int][math]::Round($c.Location.Y * $Factor))
-        $c.Size = New-Object System.Drawing.Size(
-            [int][math]::Round($c.Size.Width * $Factor),
-            [int][math]::Round($c.Size.Height * $Factor))
+    # 布局缩放交给 WinForms 自己做：Anchor、嵌套容器、滚动条它都会一并处理，
+    # 比手工逐个改 Location/Size 可靠。
+    $Root.Scale((New-Object System.Drawing.SizeF($Factor, $Factor)))
 
-        if ($c -is [System.Windows.Forms.ListBox]) {
-            $c.ItemHeight = [int][math]::Round($c.ItemHeight * $Factor)
+    for ($i = 0; $i -lt $script:ScaleBackupControls.Count; $i++) {
+        $c  = $script:ScaleBackupControls[$i]
+        $pt = $script:ScaleBackupSizes[$i]
+
+        if ([math]::Abs([double]$c.Font.Size - [double]$pt) -gt 0.01) {
+            $c.Font = New-Object System.Drawing.Font($c.Font.FontFamily, $pt, $c.Font.Style)
+        }
+
+        # 行高不属于 Control 的尺寸，Scale 不会动它，得自己乘
+        if ($c -is [System.Windows.Forms.ListBox] -and [int]$script:ScaleBackupItemH[$i] -gt 0) {
+            $c.ItemHeight = [int][math]::Round([int]$script:ScaleBackupItemH[$i] * $Factor)
         }
         if ($c -is [System.Windows.Forms.DataGridView]) {
-            $c.RowTemplate.Height = [int][math]::Round($c.RowTemplate.Height * $Factor)
+            $c.RowTemplate.Height  = [int][math]::Round($c.RowTemplate.Height * $Factor)
             $c.ColumnHeadersHeight = [int][math]::Round($c.ColumnHeadersHeight * $Factor)
-            # 列宽不是 Control 的属性，自动缩放管不到，得自己乘一遍，
-            # 否则字放大了列宽没变，内容会被截断
             foreach ($col in $c.Columns) {
                 $col.Width = [int][math]::Round($col.Width * $Factor)
             }
         }
-
     }
 
-    # 窗体放到最后放大：此时所有子控件的锚点都还是 None，不会被锚点再调整一次
-    if ($Root -is [System.Windows.Forms.Form]) {
-        $Root.Size = New-Object System.Drawing.Size(
-            [int][math]::Round($Root.Size.Width * $Factor),
-            [int][math]::Round($Root.Size.Height * $Factor))
-        if ($Root.MinimumSize.Width -gt 0 -and $Root.MinimumSize.Height -gt 0) {
-            $Root.MinimumSize = New-Object System.Drawing.Size(
-                [int][math]::Round($Root.MinimumSize.Width * $Factor),
-                [int][math]::Round($Root.MinimumSize.Height * $Factor))
-        }
-    }
-
-    # 锚点装回去，之后用户手动拉窗口仍然按原设计自动伸缩
-    for ($i = 0; $i -lt $script:UiScaleControls.Count; $i++) {
-        $script:UiScaleControls[$i].Anchor = $script:UiScaleAnchors[$i]
+    if ($Root.MinimumSize.Width -gt 0 -and $Root.MinimumSize.Height -gt 0) {
+        $Root.MinimumSize = New-Object System.Drawing.Size(
+            [int][math]::Round($Root.MinimumSize.Width * $Factor),
+            [int][math]::Round($Root.MinimumSize.Height * $Factor))
     }
 }
 
