@@ -1755,7 +1755,7 @@ NetSwitch $script:Version - 用法提示
 #
 # 开启后文字按真实 DPI 渲染、不再发虚；布局同步按下述缩放逻辑处理。
 # 若界面出现偏移或溢出，把这一行改成 $false 即回到系统拉伸的旧行为。
-$script:EnableDpiAwareness = $false
+$script:EnableDpiAwareness = $true
 
 # 命令行 -DpiMode on|off 可临时覆盖上面的设置，仅用于诊断对比，不写回文件
 if ($script:DpiModeOverride -eq 'on')  { $script:EnableDpiAwareness = $true }
@@ -1913,19 +1913,19 @@ function Initialize-UiScale {
 
 function New-FormFont {
     param([single]$Size = 9, [string]$Style = 'Regular')
-    # 字号用「磅」为单位，磅是物理单位，高 DPI 感知下系统会自动换成更多像素，
-    # 视觉大小保持不变。这里乘 UiScale 是为了让字与放大后的控件保持原有比例。
-    $pt = $Size * $script:UiScale
+    # 这里千万不能乘 UiScale。磅（pt）是物理单位：未声明感知时系统把 9pt 渲染成 12px 再拉伸
+    # 1.5 倍显示，等效视觉大小就是 13.5pt；声明感知后 9pt 直接按真实 DPI 渲染成 18px，
+    # 视觉大小与拉伸后完全一致。再乘一次就会把字放大 50%，字会顶破按钮。
     try {
-        return (New-Object System.Drawing.Font('Microsoft YaHei UI', $pt, [System.Drawing.FontStyle]$Style))
+        return (New-Object System.Drawing.Font('Microsoft YaHei UI', $Size, [System.Drawing.FontStyle]$Style))
     } catch {
-        return (New-Object System.Drawing.Font('Microsoft Sans Serif', $pt, [System.Drawing.FontStyle]$Style))
+        return (New-Object System.Drawing.Font('Microsoft Sans Serif', $Size, [System.Drawing.FontStyle]$Style))
     }
 }
 
 function New-MonoFont {
     param([single]$Size = 9)
-    return (New-Object System.Drawing.Font('Consolas', ($Size * $script:UiScale)))
+    return (New-Object System.Drawing.Font('Consolas', $Size))
 }
 
 # ============================== Win11 风格主题 ==============================
@@ -2546,6 +2546,10 @@ function Show-AdapterRebindDialog {
         }
 
         $form = New-Object System.Windows.Forms.Form
+        # 关键：关掉 WinForms 的自动缩放。窗体默认是 Font 模式，若在设置字体之前已经排过一次版，
+        # AutoScaleDimensions 记下的是「旧字体」的尺寸；随后字体被调大，WinForms 会再按字体比例缩放一遍，
+        # 与下面手工的 DPI 缩放叠加，整个窗口会被放大约 2.25 倍、直接超出屏幕。
+        $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
         $form.Text = '重新绑定网卡'
         $form.Size = New-Object System.Drawing.Size(520, 420)
         $form.MinimumSize = New-Object System.Drawing.Size(480, 380)
@@ -2680,6 +2684,10 @@ function Show-ProfileEditor {
     Add-Type -AssemblyName System.Drawing
 
     $form = New-Object System.Windows.Forms.Form
+    # 关键：关掉 WinForms 的自动缩放。窗体默认是 Font 模式，若在设置字体之前已经排过一次版，
+    # AutoScaleDimensions 记下的是「旧字体」的尺寸；随后字体被调大，WinForms 会再按字体比例缩放一遍，
+    # 与下面手工的 DPI 缩放叠加，整个窗口会被放大约 2.25 倍、直接超出屏幕。
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $form.Text = if ($null -eq $SourceProfile) { '新建配置集' } else { "编辑配置集 - $($SourceProfile.name)" }
     $form.Size = New-Object System.Drawing.Size(1020, 620)
     $form.MinimumSize = New-Object System.Drawing.Size(900, 560)
@@ -3004,6 +3012,10 @@ function Show-BackupManager {
     $script:BackupManagerChanged = $false
 
     $form = New-Object System.Windows.Forms.Form
+    # 关键：关掉 WinForms 的自动缩放。窗体默认是 Font 模式，若在设置字体之前已经排过一次版，
+    # AutoScaleDimensions 记下的是「旧字体」的尺寸；随后字体被调大，WinForms 会再按字体比例缩放一遍，
+    # 与下面手工的 DPI 缩放叠加，整个窗口会被放大约 2.25 倍、直接超出屏幕。
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $form.Text = '备份记录（切换配置集前自动保存）'
     $form.Size = New-Object System.Drawing.Size(620, 452)
     $form.StartPosition = 'CenterParent'
@@ -3172,6 +3184,10 @@ function Show-MainForm {
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
     $form = New-Object System.Windows.Forms.Form
+    # 关键：关掉 WinForms 的自动缩放。窗体默认是 Font 模式，若在设置字体之前已经排过一次版，
+    # AutoScaleDimensions 记下的是「旧字体」的尺寸；随后字体被调大，WinForms 会再按字体比例缩放一遍，
+    # 与下面手工的 DPI 缩放叠加，整个窗口会被放大约 2.25 倍、直接超出屏幕。
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $form.Text = "NetSwitch $script:Version  -  内网 IP / 网关 一键切换"
     $form.Size = New-Object System.Drawing.Size(1180, 760)
     # 最小尺寸不能随便给：右侧操作区 8 个按钮固定宽 866px（左侧面板 292 + 866 = 1158 客户区），
