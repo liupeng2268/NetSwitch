@@ -1836,11 +1836,8 @@ function Invoke-UiScaleLayout {
         }
     }
 
-    if ($Root.MinimumSize.Width -gt 0 -and $Root.MinimumSize.Height -gt 0) {
-        $Root.MinimumSize = New-Object System.Drawing.Size(
-            [int][math]::Round($Root.MinimumSize.Width * $Factor),
-            [int][math]::Round($Root.MinimumSize.Height * $Factor))
-    }
+    # 注意：MinimumSize 不要在这里再乘一次 —— Control.Scale 已经把它缩放过了。
+    # 再乘一遍会让最小尺寸变成 2655x1620，超过屏幕工作区，窗口会被硬撑成满屏。
 }
 
 # 双击 .bat 启动时，cmd 那个黑窗口会一直挂在图形界面后面等进程结束。
