@@ -1740,9 +1740,9 @@ NetSwitch $script:Version - 用法提示
 #   1) 在「任何窗口被创建之前」声明本进程为高 DPI 感知 —— 系统不再拉伸，改由程序按真实 DPI 渲染；
 #   2) 再把所有控件的坐标、尺寸、行高按同一个倍数放大，把视觉尺寸补回来。
 #
-# 默认关闭：开启后文字变清晰，但布局要依赖这台机器的真实 DPI，开发机上没法验证，
-# 所以需要你实际跑一次确认；确认没问题再把这一行改成 $true。
-$script:EnableDpiAwareness = $false
+# 开启后文字按真实 DPI 渲染、不再发虚，布局同步放大以保持原本的视觉大小。
+# 若某台机器上界面出现偏移或溢出，把这一行改成 $false 即回到系统拉伸的旧行为。
+$script:EnableDpiAwareness = $true
 
 # 所有坐标与字体的统一放大倍数。100% 缩放下恒为 1，等价于不做任何缩放。
 $script:UiScale = 1.0
@@ -1806,6 +1806,11 @@ function Invoke-UiScaleLayout {
         if ($c -is [System.Windows.Forms.DataGridView]) {
             $c.RowTemplate.Height = [int][math]::Round($c.RowTemplate.Height * $Factor)
             $c.ColumnHeadersHeight = [int][math]::Round($c.ColumnHeadersHeight * $Factor)
+            # 列宽不是 Control 的属性，自动缩放管不到，得自己乘一遍，
+            # 否则字放大了列宽没变，内容会被截断
+            foreach ($col in $c.Columns) {
+                $col.Width = [int][math]::Round($col.Width * $Factor)
+            }
         }
 
     }
@@ -2160,11 +2165,33 @@ function ConvertTo-UiCard {
     return $card
 }
 
+# 打开控件的双缓冲。Control.SetStyle / DoubleBuffered 都是 protected 成员，
+# 脚本里只能靠反射设置；失败就原样放过，不影响功能。
+function Enable-UiDoubleBuffer {
+    param($Control)
+
+    try {
+        $flags = [System.Reflection.BindingFlags]'Instance, NonPublic'
+        $method = [System.Windows.Forms.Control].GetMethod('SetStyle', $flags)
+        if ($null -eq $method) { return }
+
+        $styles = [System.Windows.Forms.ControlStyles]::AllPaintingInWmPaint -bor
+                  [System.Windows.Forms.ControlStyles]::OptimizedDoubleBuffer -bor
+                  [System.Windows.Forms.ControlStyles]::UserPaint
+
+        [void]$method.Invoke($Control, @($styles, $true))
+    } catch { }
+}
+
 # 递归套用主题。先处理容器（决定底色），再处理子控件。
 function Invoke-UiTheme {
     param($Root)
 
     $t = Get-UiThemeMap
+
+    # 卡片 / 列表都是自绘的，WinForms 默认不开双缓冲，重绘时先擦背景再画内容，
+    # 点一下列表就能看到整块区域闪一下。这里统一打开双缓冲。
+    Enable-UiDoubleBuffer $Root
 
     if ($Root -is [System.Windows.Forms.Form]) {
         $Root.BackColor = $t.Bg
