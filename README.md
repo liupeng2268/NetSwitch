@@ -2,6 +2,16 @@
 
 一个零依赖的 Windows 小工具：把常用的几套网络参数（IP、子网掩码、网关、DNS）存成「配置集」，需要切换时点一下就好，不用再去「网络和 Internet 设置」里一层层点。
 
+> **两个版本**
+>
+> | 版本 | 位置 | 说明 |
+> | --- | --- | --- |
+> | PowerShell 版 | `NetSwitch.ps1` | 当前主线。零依赖，系统自带 PowerShell 即可运行 |
+> | C# 版 | `src/NetSwitch/` | 同功能的原生编译版，需本地构建（见第十五节） |
+>
+> 两个版本读写**同一份 `profiles.json`**，数据格式逐字节兼容，可随时互相接管。
+> 以下第一至十四节讲的是 PowerShell 版；功能与界面两者一致，构建方式见第十五节。
+
 纯 PowerShell + WinForms 实现，**不需要安装 Python / Node / 任何第三方库**，Windows 8 / Server 2012 及以上（含 Win10 / Win11）直接可用。
 
 ---
@@ -472,3 +482,102 @@ protected 成员，脚本侧只能用反射设置，失败则原样放过）。
 双击 `NetSwitch.bat` 启动时，cmd 的黑窗口会一直挂在图形界面后面等待进程结束。
 现在界面显示出来之后自动把它收起来；并且只在父进程是 `explorer.exe` 或 `cmd.exe`
 （也就是双击启动的场景）时执行，不会动到用户自己打开的终端。
+
+---
+
+## 十五、C# 版（原生编译版）
+
+除主线 PowerShell 版外，仓库还包含一份**功能等价**的 C# / .NET 8 WinForms 实现，位于 `src/NetSwitch/`。
+
+### 它解决什么问题
+
+PowerShell 版够用，但有几处绕不开的先天限制：
+
+| 痛点 | PowerShell 版 | C# 版 |
+| --- | --- | --- |
+| 高分屏文字发虚 | 需手工声明 DPI 感知 + 手动缩放控件（脆弱，踩过多轮坑） | csproj 声明 `PerMonitorV2`，原生清晰 |
+| 双击启动残留黑窗 | `.bat` 拉起 cmd 窗口，界面关闭后需主动收起 | `WinExe` 输出，天生无控制台窗口 |
+| 冷启动速度 | 端到端约 6~9 秒（每次加载脚本解释器 + 4 个网络 cmdlet 模块） | 见下方「启动速度实测」 |
+| 中文编码 | UTF-8 无 BOM 的脚本会被按 GBK 解析导致乱码 | 源码 UTF-8，无此问题 |
+
+代价：C# 版需要**本地编译**才能使用，不能像脚本那样拷过去就跑。
+
+### 启动速度实测
+
+用同一命令（`-ListAdapters`）在本机各连跑三次，端到端计时：
+
+| 版本 | 第 1 次 | 第 2 次 | 第 3 次 | 分发体积 |
+| --- | --- | --- | --- | --- |
+| PowerShell 版 | 9.3 秒 | 8.1 秒 | 6.0 秒 | 一个脚本 |
+| C# 单文件版 | 5.6 秒 | 1.3 秒 | 1.1 秒 | 单文件 64 MB |
+| C# 多文件版 | 4.2 秒 | 0.8 秒 | 0.8 秒 | 一整个目录约 147 MB |
+
+三点结论（都基于上面的实测，供参考）：
+
+- **首次启动慢是正常的，不是 bug**。单文件版首次要把打包的运行时解压到临时目录
+  （本机实测约 24 MB），解压结果后续复用，所以第 2 次起降到 1 秒出头。
+- **C# 版稳定后（约 1 秒）明显快于 PowerShell 版（约 6~8 秒）**，这是它的主要速度优势。
+  但**别期待「双击秒开 0.2 秒」**——单文件自包含格式为了「免安装」牺牲了首次启动速度。
+- **不建议为了 0.3 秒改成多文件版**。多文件版稳定后仅快约 0.3 秒（0.8 vs 1.1），
+  却要放弃「一个 exe 拷来拷去」的便利、改成分发 147 MB 的整个目录。默认的单文件方案更划算。
+  仅在极在意首启动且能接受整目录分发时，才在 `build.bat` 的 publish 参数里去掉 `PublishSingleFile`。
+
+
+### 环境要求
+
+- **编译**：需要 .NET 8 SDK（一次性，装在你自己机器上）。
+  下载：<https://dotnet.microsoft.com/download/dotnet/8.0>
+- **运行**：**不需要装任何东西**。发布产物是自包含单文件，目标机器（Win10 / Win11 x64）双击即用。
+
+> 关键区分：SDK 只在「编译打包」这一步需要；生成出来的 `NetSwitch.exe` 把运行时都打包进去了，
+> 分发到医院内网其他机器时无需安装 .NET。
+
+### 构建
+
+双击 `build.bat`。脚本会：定位 SDK（优先用仓库自带的 `tools\dotnet-sdk\`，否则用系统 dotnet）
+→ 清理旧产物 → `dotnet publish` 出单文件自包含 exe 到 `发布\NetSwitch.exe`（约 64 MB）。
+
+或手动执行：
+
+```
+dotnet publish src/NetSwitch/NetSwitch.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o 发布
+```
+
+### 分发
+
+把 `发布\NetSwitch.exe` 和 `profiles.json`（同目录放一份）拷到目标机器即可。
+exe 会在自身所在目录找 `profiles.json`，找不到则用 `%APPDATA%\NetSwitch\`，再没有就生成默认配置。
+
+### 命令行用法（与 PowerShell 版一致）
+
+```
+NetSwitch.exe -ListProfiles           列出全部配置集
+NetSwitch.exe -ListAdapters           列出本机网卡
+NetSwitch.exe -ShowStatus             查看当前网络状态
+NetSwitch.exe -Apply "门诊楼"         应用指定配置集（会自动请求 UAC 提权）
+NetSwitch.exe -Apply "门诊楼" -Silent 静默应用（供桌面快捷方式调用）
+NetSwitch.exe -ExportFile 路径        导出配置
+NetSwitch.exe -ImportFile 路径        导入配置
+NetSwitch.exe -ConfigPath 路径        指定配置文件位置
+```
+
+不带参数运行即进入图形界面。
+
+### 数据兼容
+
+C# 版与 PowerShell 版读写**同一份 `profiles.json`**，且**逐字节兼容**——
+C# 版重新序列化现有文件后输出与原文件完全相同（已实测）。因此：
+
+- 用 PowerShell 版建的配置，C# 版可直接接管，反之亦然
+- 备份文件（`backups\`）、路由记录（`applied-routes.json`）格式也一致
+- 唯一已知无害差异：备份文件里空列表的写法不同（一个写 `null`、一个写 `[]`），
+  反序列化后都是空列表，不影响功能
+
+### 开发期诊断参数（普通用户无需关心）
+
+| 参数 | 作用 |
+| --- | --- |
+| `-ShotDir 目录` | 主窗体自动截图，输出 PNG + `layout.txt`（控件坐标）；目录名含 `buffer` 时改跑双缓冲自检 |
+| `-DialogsShot 目录` | 依次弹出各对话框并截图，用于核对对话框布局 |
+
+这两个是排查高 DPI 布局、界面闪烁时用的，不改变程序对用户的正常行为。

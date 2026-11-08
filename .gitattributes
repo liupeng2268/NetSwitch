@@ -3,3 +3,15 @@
 *.bat text eol=crlf
 *.md  text eol=lf
 *.json text eol=lf
+
+# C# 源码：统一 LF，避免不同机器换行符反复产生 diff 噪音
+*.cs     text eol=lf
+*.csproj text eol=lf
+*.sln    text eol=lf
+
+# 二进制不做换行转换，也不让 git 猜
+*.exe binary
+*.dll binary
+*.png binary
+*.ico binary
+*.zip binary
