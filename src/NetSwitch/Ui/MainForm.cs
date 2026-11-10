@@ -547,7 +547,7 @@ public sealed class MainForm : Form
     {
         try
         {
-            _txtStatus.Text = _services.Status.GetStatusText();
+            _txtStatus.Text = _services.Status.GetStatusText(includeIpv6: true);
         }
         catch (Exception ex)
         {

@@ -205,6 +205,8 @@ public sealed class ProfileStore : IProfileStore
                 Gateways = item.Gateways is null ? null : new List<string>(item.Gateways),
                 Dns = item.Dns is null ? null : new List<string>(item.Dns),
                 Routes = item.Routes is null ? null : new List<string>(item.Routes),
+                DhcpStaticCoexist = item.DhcpStaticCoexist,
+                Ipv6Enabled = item.Ipv6Enabled,
             });
         }
         return result;

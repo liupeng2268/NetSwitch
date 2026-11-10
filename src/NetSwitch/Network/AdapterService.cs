@@ -268,6 +268,20 @@ public sealed class AdapterService : IAdapterService
     private static string JoinNames(IEnumerable<AdapterInfo> adapters)
         => string.Join('、', adapters.Select(a => a.Name));
 
+    /// <summary>
+    /// IPv6 展示过滤：排除回环 ::1、未指定 ::、链路本地 fe80: 与文档保留 2001:db8:，
+    /// 其余（全局单播 / fc00::/7 唯一本地）保留用于只读展示。CIM 与退路共用同一口径。
+    /// </summary>
+    private static bool IsDisplayableIPv6(string? ip)
+    {
+        if (string.IsNullOrWhiteSpace(ip)) return false;
+        var text = ip.Trim();
+        if (text == "::1" || text == "::") return false;
+        if (text.StartsWith("fe80:", StringComparison.OrdinalIgnoreCase)) return false;
+        if (text.StartsWith("2001:db8:", StringComparison.OrdinalIgnoreCase)) return false;
+        return true;
+    }
+
     /// <summary>首选路径：CIM MSFT_NetAdapter + 地址 / 路由 / DNS / DHCP 合并。</summary>
     private static List<AdapterProbe> BuildFromCim()
     {
@@ -295,7 +309,7 @@ public sealed class AdapterService : IAdapterService
             result.Add(new AdapterProbe(info, Cim.ToBool(Cim.Get(instance, "Virtual"))));
         }
 
-        // 地址 / 网关 / DNS / DHCP：各查一次全量，再按 InterfaceIndex 配对
+        // 地址 / IPv6 / 网关 / DNS / DHCP：各查一次全量，再按 InterfaceIndex 配对
         var ipv4ByIndex = new Dictionary<int, List<CimInstance>>();
         foreach (var instance in Cim.Query(session, Cim.StandardCimv2,
                      "SELECT * FROM MSFT_NetIPAddress WHERE AddressFamily = 2"))
@@ -307,6 +321,23 @@ public sealed class AdapterService : IAdapterService
                 ipv4ByIndex[index] = list;
             }
             list.Add(instance);
+        }
+
+        // IPv6 地址：与 IPv4 对称地再查一次全量（AddressFamily = 23），按 InterfaceIndex 配对。
+        // 只用于 GUI 只读展示，不写回配置。
+        var ipv6ByIndex = new Dictionary<int, List<string>>();
+        foreach (var instance in Cim.Query(session, Cim.StandardCimv2,
+                     "SELECT * FROM MSFT_NetIPAddress WHERE AddressFamily = 23"))
+        {
+            var index = Cim.ToInt(Cim.Get(instance, "InterfaceIndex"));
+            var ip = Cim.ToStr(Cim.Get(instance, "IPAddress"));
+            if (!IsDisplayableIPv6(ip)) continue;
+            if (!ipv6ByIndex.TryGetValue(index, out var list))
+            {
+                list = new List<string>();
+                ipv6ByIndex[index] = list;
+            }
+            if (!list.Contains(ip)) list.Add(ip);
         }
 
         var dhcpByIndex = new Dictionary<int, bool>();
@@ -356,6 +387,7 @@ public sealed class AdapterService : IAdapterService
             info.DhcpEnabled = dhcpByIndex.TryGetValue(index, out var dhcp) && dhcp;
             info.Gateways = gatewaysByIndex.TryGetValue(index, out var gw) ? gw : new List<string>();
             info.DnsServers = dnsByIndex.TryGetValue(index, out var dns) ? dns : new List<string>();
+            info.Ipv6Addresses = ipv6ByIndex.TryGetValue(index, out var v6) ? v6 : new List<string>();
 
             if (ipv4ByIndex.TryGetValue(index, out var addresses))
             {
@@ -425,6 +457,16 @@ public sealed class AdapterService : IAdapterService
                     info.PrefixLength = unicast.PrefixLength;
                     break;
                 }
+                // IPv6 只读展示：与 CIM 路径共用同一套过滤口径
+                foreach (var unicast in props.UnicastAddresses)
+                {
+                    if (unicast.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6) continue;
+                    var v6 = unicast.Address.ToString();
+                    if (IsDisplayableIPv6(v6) && !info.Ipv6Addresses.Contains(v6))
+                    {
+                        info.Ipv6Addresses.Add(v6);
+                    }
+                }
                 foreach (var gateway in props.GatewayAddresses)
                 {
                     if (gateway.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) continue;
@@ -459,7 +501,8 @@ public sealed class AdapterService : IAdapterService
 
 /// <summary>
 /// 一块网卡的数据 + 数据源自带的 Virtual 标记。
-/// 拆出来是因为 <see cref="AdapterInfo"/> 是 P0 已落定的模型，不能加字段。
+/// <see cref="AdapterInfo"/> 是运行期快照（不落盘），允许按需增加只读字段（如 IPv6 地址）；
+/// 此处单独包一层只是为了附带数据源自带的 <see cref="VirtualFlag"/> 标记。
 /// <see cref="VirtualFlag"/> 为 <c>null</c> 表示该数据源没有此属性（旧版对这种情况只走模式匹配）。
 /// </summary>
 internal sealed class AdapterProbe

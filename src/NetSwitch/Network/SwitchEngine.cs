@@ -134,6 +134,25 @@ public sealed class SwitchEngine : ISwitchEngine
 
         Log.Info($"网卡「{name}」(#{index}) -> {(isDhcp ? "DHCP 自动获取" : "静态 IP")}");
 
+        // 功能 3：IPv6 绑定开关。仅 HasValue 时管理；null = 完全不改动现有绑定（不新增任何动作）。
+        // 放在 IP 配置之前，与 DHCP / 静态分支无关。
+        if (config.Ipv6Enabled.HasValue)
+        {
+            _network.SetIpv6Binding(index, config.Ipv6Enabled.Value);
+        }
+
+        // 功能 2：DHCP 与静态 IP 共存。仅显式 true 时启用；null/false 时下面整段都不执行，
+        // 执行路径与改造前完全一致（不新增任何动作）。
+        List<(string Address, int PrefixLength)>? preservedStaticIpv4 = null;
+        if (config.DhcpStaticCoexist == true)
+        {
+            // ResetInterfaceIPv4 会清空该网卡全部 IPv4，必须在它之前读出手工静态地址
+            preservedStaticIpv4 = _network.GetStaticIPv4Addresses(index);
+            _network.SetDhcpStaticIpCoexistence(index, enabled: true);
+            Log.Info($"  已开启 DHCP/静态 IP 共存，暂存 {preservedStaticIpv4.Count} 个静态 IPv4 地址。");
+            Log.Info("  提示：WaitDhcpAddress 可能把保留的静态 IP 误判为 DHCP 地址，属已知现象，不改变其返回值语义。");
+        }
+
         _network.ResetInterfaceIPv4(index);
 
         if (isDhcp)
@@ -145,7 +164,40 @@ public sealed class SwitchEngine : ISwitchEngine
             if (!ApplyStatic(index, name, config, dnsList)) return;
         }
 
+        // 功能 2：DHCP 启用后把 Reset 前暂存的静态地址写回；失败只 WARN，不阻断主流程。
+        if (preservedStaticIpv4 is not null && preservedStaticIpv4.Count > 0)
+        {
+            RestoreStaticIPv4(index, preservedStaticIpv4);
+        }
+
         ApplyExtraRoutes(index, config);
+    }
+
+    /// <summary>
+    /// 把 Reset 前暂存的静态 IPv4 地址逐个写回（DHCP/静态共存）。
+    /// 新增网络操作：try/catch + WARN，不抛到上层、不阻断主流程，也不做自动回滚。
+    /// </summary>
+    private void RestoreStaticIPv4(int index, List<(string Address, int PrefixLength)> addresses)
+    {
+        foreach (var (address, prefix) in addresses)
+        {
+            try
+            {
+                var effectivePrefix = prefix > 0 ? prefix : 24;
+                if (_network.SetStaticAddress(index, address, effectivePrefix, null))
+                {
+                    Log.Ok($"  已写回保留的静态 IP {address}/{effectivePrefix}");
+                }
+                else
+                {
+                    Log.Warn($"  写回保留的静态 IP {address} 失败（不影响本次切换）。");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"  写回保留的静态 IP {address} 失败（不影响本次切换）：{ex.Message}");
+            }
+        }
     }
 
     // ── DHCP 分支 ─────────────────────────────────────────────────────────

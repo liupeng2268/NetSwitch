@@ -79,6 +79,24 @@ public interface INetworkApi
 
     /// <summary>尽力而为的 IP 冲突探测（arp -d + ping + arp -a）。命中返回 true。</summary>
     bool TestIpConflict(string ipAddress);
+
+    /// <summary>
+    /// 开启/关闭网卡 IPv4 接口上的「DHCP 与静态 IP 共存」（DhcpStaticIpCoexistence）。
+    /// 失败只记 WARN，不抛到上层。
+    /// </summary>
+    void SetDhcpStaticIpCoexistence(int interfaceIndex, bool enabled);
+
+    /// <summary>
+    /// 启用/禁用该网卡的 IPv6 协议绑定（ms_tcpip6），等价 Enable-/Disable-NetAdapterBinding。
+    /// 失败只记 WARN，不抛到上层。
+    /// </summary>
+    void SetIpv6Binding(int interfaceIndex, bool enabled);
+
+    /// <summary>
+    /// 读取网卡上手动配置的静态 IPv4 地址与前缀长度，供 DHCP/静态共存切换前暂存。
+    /// 失败返回空列表，不抛到上层。
+    /// </summary>
+    List<(string Address, int PrefixLength)> GetStaticIPv4Addresses(int interfaceIndex);
 }
 
 /// <summary>
@@ -114,6 +132,10 @@ public interface ISwitchEngine
 /// <summary>当前网络状态文本（用于主界面状态卡片与 CLI -ShowStatus）。</summary>
 public interface IStatusReader
 {
-    /// <summary>生成多行状态文本。快路径走 CIM，失败回退 cmdlet 等价实现。</summary>
-    string GetStatusText();
+    /// <summary>
+    /// 生成多行状态文本。快路径走 CIM，失败回退 cmdlet 等价实现。
+    /// <paramref name="includeIpv6"/> 默认 false，输出与旧版逐字一致；
+    /// 仅 GUI 状态卡片显式传 true 追加 IPv6 行，CLI 一律不传。
+    /// </summary>
+    string GetStatusText(bool includeIpv6 = false);
 }

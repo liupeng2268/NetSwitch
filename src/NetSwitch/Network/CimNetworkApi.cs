@@ -60,6 +60,8 @@ public sealed class CimNetworkApi : INetworkApi, INetworkApiDiagnostics
     private const ushort AddressFamilyIPv4 = 2;
     private const byte DhcpDisabled = 0;
     private const byte DhcpEnabled = 1;
+    private const byte CoexistDisabled = 0;          // MSFT_NetIPInterface.DhcpStaticIpCoexistence
+    private const byte CoexistEnabled = 1;
     private const ushort RouteProtocolNetMgmt = 3;   // NetRoute.Protocol.NetMgmt
     private const byte PublishNo = 0;                // NetRoute.Publish.No
 
@@ -379,6 +381,108 @@ public sealed class CimNetworkApi : INetworkApi, INetworkApiDiagnostics
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 开启/关闭 DHCP 与静态 IP 共存。CIM 类型按 <see cref="SetDhcp"/> 的 UInt8 范式推断：
+    /// DhcpStaticIpCoexistence 是 0/1 枚举值，与 Dhcp 一样用 ModifyInstance 写入。
+    /// 失败只记 WARN，不抛到上层、不阻断主流程。
+    /// </summary>
+    public void SetDhcpStaticIpCoexistence(int interfaceIndex, bool enabled)
+    {
+        try
+        {
+            using var session = Cim.CreateSession();
+            var instance = Cim.QuerySingle(session, Cim.StandardCimv2,
+                $"SELECT * FROM MSFT_NetIPInterface WHERE InterfaceIndex = {interfaceIndex} AND AddressFamily = {AddressFamilyIPv4}");
+
+            if (instance is null)
+            {
+                Log.Warn($"设置网卡 #{interfaceIndex} 的 DHCP/静态共存失败：找不到对应的 IPv4 接口。");
+                return;
+            }
+
+            var options = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("DhcpStaticIpCoexistence",
+                    enabled ? CoexistEnabled : CoexistDisabled, CimType.UInt8, CimFlags.Parameter),
+            };
+            session.InvokeMethod(Cim.StandardCimv2, instance, "ModifyInstance", options);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"设置网卡 #{interfaceIndex} 的 DHCP/静态共存失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 启用/禁用网卡的 IPv6 协议绑定（ms_tcpip6），等价 Enable-/Disable-NetAdapterBinding。
+    /// 失败只记 WARN，不抛到上层、不阻断主流程。
+    /// </summary>
+    public void SetIpv6Binding(int interfaceIndex, bool enabled)
+    {
+        try
+        {
+            using var session = Cim.CreateSession();
+
+            // MSFT_NetAdapterBinding 在部分系统上不直接暴露 InterfaceIndex，
+            // 先由 MSFT_NetAdapter 把索引换成网卡名，再按 Name + ComponentID 精确定位。
+            var adapter = Cim.QuerySingle(session, Cim.StandardCimv2,
+                $"SELECT * FROM MSFT_NetAdapter WHERE InterfaceIndex = {interfaceIndex}");
+            var name = adapter is null ? "" : Cim.ToStr(Cim.Get(adapter, "Name"));
+
+            var filter = name.Length > 0
+                ? $"SELECT * FROM MSFT_NetAdapterBinding WHERE Name = '{Cim.Escape(name)}' AND ComponentID = 'ms_tcpip6'"
+                : $"SELECT * FROM MSFT_NetAdapterBinding WHERE InterfaceIndex = {interfaceIndex} AND ComponentID = 'ms_tcpip6'";
+            var binding = Cim.QuerySingle(session, Cim.StandardCimv2, filter);
+
+            if (binding is null)
+            {
+                Log.Warn($"设置网卡 #{interfaceIndex} 的 IPv6 绑定失败：找不到 ms_tcpip6 绑定项。");
+                return;
+            }
+
+            // Enable() / Disable() 无入参，等价于 Enable-/Disable-NetAdapterBinding
+            session.InvokeMethod(Cim.StandardCimv2, binding, enabled ? "Enable" : "Disable",
+                new CimMethodParametersCollection());
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"设置网卡 #{interfaceIndex} 的 IPv6 绑定失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 读取手动配置的静态 IPv4 地址与前缀，供 DHCP/静态共存切换前暂存。
+    /// 失败返回空列表，不抛到上层。
+    /// </summary>
+    public List<(string Address, int PrefixLength)> GetStaticIPv4Addresses(int interfaceIndex)
+    {
+        var result = new List<(string Address, int PrefixLength)>();
+        try
+        {
+            using var session = Cim.CreateSession();
+            foreach (var instance in Cim.Query(session, Cim.StandardCimv2,
+                         $"SELECT * FROM MSFT_NetIPAddress WHERE InterfaceIndex = {interfaceIndex} AND AddressFamily = {AddressFamilyIPv4}"))
+            {
+                var ip = Cim.ToStr(Cim.Get(instance, "IPAddress"));
+                if (ip.Length == 0 || ip == "127.0.0.1") continue;
+                if (ip.StartsWith("169.254.", StringComparison.Ordinal)) continue;
+
+                // PrefixOrigin：1=Manual（手工静态）、3=Dhcp。只保留静态地址；
+                // 属性读不到（0=Other）时按宽松策略保留，避免旧系统漏掉用户手配的地址。
+                var origin = Cim.ToInt(Cim.Get(instance, "PrefixOrigin"));
+                if (origin == 3) continue;
+
+                var prefix = Cim.ToInt(Cim.Get(instance, "PrefixLength"));
+                result.Add((ip, prefix));
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"读取网卡 #{interfaceIndex} 的静态 IPv4 地址失败：{ex.Message}");
+        }
+        return result;
     }
 
     // ── 内部实现 ──────────────────────────────────────────────────────────

@@ -213,6 +213,19 @@ public static class PsJson
                 ("dns",           (b, c) => WriteStringList(b, a.Dns, c)),
                 ("routes",        (b, c) => WriteStringList(b, a.Routes, c)),
             };
+
+            // 两个新增键是「可选键」：仅当模型里显式设置过（HasValue）才加入成员列表。
+            // 旧配置文件缺这两个键 → 反序列化后为 null → 列表恰好仍是原来 10 个成员，
+            // 顺序 / 缩进 / 逗号 / defaultMetric 无条件写 null 全部不变，Repair→Serialize 逐字节一致。
+            if (a.DhcpStaticCoexist.HasValue)
+            {
+                members.Add(("dhcpStaticCoexist", (b, c) => b.Append(a.DhcpStaticCoexist.Value ? "true" : "false")));
+            }
+            if (a.Ipv6Enabled.HasValue)
+            {
+                members.Add(("ipv6Enabled", (b, c) => b.Append(a.Ipv6Enabled.Value ? "true" : "false")));
+            }
+
             WriteMembers(sb, members, elemCol);
             sb.Append(' ', elemCol).Append('}');
             if (i < adapters.Count - 1) sb.Append(',');

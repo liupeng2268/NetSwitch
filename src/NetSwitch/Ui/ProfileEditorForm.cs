@@ -38,6 +38,8 @@ public sealed class ProfileEditorForm : Form
     private const string ColDns = "colDns";
     private const string ColMetric = "colMetric";
     private const string ColRoutes = "colRoutes";
+    private const string ColDhcpCoexist = "colDhcpCoexist";
+    private const string ColIpv6 = "colIpv6";
 
     public ProfileEditorForm(AppServices services, Profile? source)
     {
@@ -85,6 +87,8 @@ public sealed class ProfileEditorForm : Form
                 Gateways = a.Gateways is null ? null : new List<string>(a.Gateways),
                 Dns = a.Dns is null ? null : new List<string>(a.Dns),
                 Routes = a.Routes is null ? null : new List<string>(a.Routes),
+                DhcpStaticCoexist = a.DhcpStaticCoexist,
+                Ipv6Enabled = a.Ipv6Enabled,
             }).ToList(),
         };
     }
@@ -207,21 +211,28 @@ public sealed class ProfileEditorForm : Form
                 SortMode = DataGridViewColumnSortMode.NotSortable,
             };
 
+        // 11 列基准宽度合计 958，与表格控件宽 970 对齐，避免横向溢出。
+        // UiStyler.ScaleForDpi 会把表格尺寸与列宽按同一系数放大，故只改基准列宽即可；
+        // 窗体 / 控件尺寸与字体一律不动（DPI 铁律）。
         _grid.Columns.Add(new DataGridViewCheckBoxColumn
         {
             Name = ColEnabled,
             HeaderText = "启用",
-            Width = 48,
+            Width = 40,
             SortMode = DataGridViewColumnSortMode.NotSortable,
         });
-        _grid.Columns.Add(Text(ColAdapter, "网卡匹配（名称/描述/MAC）", 200));
-        _grid.Columns.Add(Text(ColMode, "模式", 70));
-        _grid.Columns.Add(Text(ColIp, "IP 地址", 118));
-        _grid.Columns.Add(Text(ColMask, "子网掩码", 118));
-        _grid.Columns.Add(Text(ColGateway, "网关（可写 1.1.1.1:10）", 150));
-        _grid.Columns.Add(Text(ColDns, "DNS（逗号分隔）", 150));
-        _grid.Columns.Add(Text(ColMetric, "默认跃点", 76));
-        _grid.Columns.Add(Text(ColRoutes, "附加路由（10.0.0.0/8>1.1.1.1）", 180));
+        _grid.Columns.Add(Text(ColAdapter, "网卡匹配（名称/描述/MAC）", 150));
+        _grid.Columns.Add(Text(ColMode, "模式", 54));
+        _grid.Columns.Add(Text(ColIp, "IP 地址", 96));
+        _grid.Columns.Add(Text(ColMask, "子网掩码", 96));
+        _grid.Columns.Add(Text(ColGateway, "网关（可写 1.1.1.1:10）", 112));
+        _grid.Columns.Add(Text(ColDns, "DNS（逗号分隔）", 112));
+        _grid.Columns.Add(Text(ColMetric, "默认跃点", 58));
+        _grid.Columns.Add(Text(ColRoutes, "附加路由（10.0.0.0/8>1.1.1.1）", 124));
+        // 两个可选开关用普通 TextBox 列表达三态（空/1/0），避免 CheckBox 只能两态、
+        // 也避免 ComboBox 触发 DataGridView DataError。列头注明取值含义。
+        _grid.Columns.Add(Text(ColDhcpCoexist, "静态共存 空/1/0", 72));
+        _grid.Columns.Add(Text(ColIpv6, "IPv6 空/1/0", 44));
     }
 
     private void LoadData()
@@ -297,6 +308,9 @@ public sealed class ProfileEditorForm : Form
         row.Cells[ColDns].Value = config.Dns is null ? "" : string.Join(", ", config.Dns);
         row.Cells[ColMetric].Value = config.DefaultMetric?.ToString() ?? "";
         row.Cells[ColRoutes].Value = config.Routes is null ? "" : string.Join(", ", config.Routes);
+        // 模型 -> 行（三态）：null -> '' / true -> '1' / false -> '0'
+        row.Cells[ColDhcpCoexist].Value = config.DhcpStaticCoexist switch { true => "1", false => "0", _ => "" };
+        row.Cells[ColIpv6].Value = config.Ipv6Enabled switch { true => "1", false => "0", _ => "" };
 
         // 把原始匹配值藏在行的 Tag 里，保存时优先用它（显示的是名称，存的是 MAC）
         row.Tag = config.Adapter;
@@ -364,6 +378,12 @@ public sealed class ProfileEditorForm : Form
             var routes = ParseList(row.Cells[ColRoutes].Value?.ToString());
             var metricText = row.Cells[ColMetric].Value?.ToString()?.Trim() ?? "";
 
+            // 两个新增开关（行 -> 模型，三态）：'' 未设置写 null（不产生新键）、
+            // '1' 启用写 true、'0' 禁用写 false。未设置时绝不写 false，
+            // 保住旧 profiles.json 不出现新键的兼容性。
+            var dhcpStaticCoexist = ParseTriState(row.Cells[ColDhcpCoexist].Value);
+            var ipv6Enabled = ParseTriState(row.Cells[ColIpv6].Value);
+
             adapters.Add(new AdapterConfig
             {
                 Adapter = string.IsNullOrWhiteSpace(storage) ? display : storage,
@@ -376,6 +396,8 @@ public sealed class ProfileEditorForm : Form
                 Gateways = gateways,
                 Dns = dns,
                 Routes = routes,
+                DhcpStaticCoexist = dhcpStaticCoexist,
+                Ipv6Enabled = ipv6Enabled,
             });
         }
 
@@ -428,6 +450,10 @@ public sealed class ProfileEditorForm : Form
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
+
+    /// <summary>三态单元格文本 -> 可空 bool：'1' 启用 / '0' 禁用 / 其他（含 ''）未设置。</summary>
+    private static bool? ParseTriState(object? value)
+        => value?.ToString()?.Trim() switch { "1" => true, "0" => false, _ => null };
 
     private static List<string> ParseList(string? text)
     {

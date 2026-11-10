@@ -85,6 +85,14 @@ public sealed class AdapterConfig
     /// <summary>附加静态路由，元素写 "10.0.0.0/8>192.168.10.254"。</summary>
     [JsonPropertyName("routes")]
     public List<string>? Routes { get; set; }
+
+    /// <summary>DHCP 模式下是否与静态 IP 共存；null/缺省表示不启用（不写入 JSON）。</summary>
+    [JsonPropertyName("dhcpStaticCoexist")]
+    public bool? DhcpStaticCoexist { get; set; }
+
+    /// <summary>是否管理该网卡的 IPv6 绑定；null 表示完全不改动现有绑定（不写入 JSON）。</summary>
+    [JsonPropertyName("ipv6Enabled")]
+    public bool? Ipv6Enabled { get; set; }
 }
 
 /// <summary>applied-routes.json 的一条记录：NetSwitch 自己加过的路由。</summary>
@@ -142,6 +150,9 @@ public sealed class AdapterInfo
 
     /// <summary>当前 DNS 列表。</summary>
     public List<string> DnsServers { get; set; } = new();
+
+    /// <summary>当前 IPv6 地址（运行期只读、不落盘；已排除回环/链路本地/文档地址）。</summary>
+    public List<string> Ipv6Addresses { get; set; } = new();
 }
 
 /// <summary>解析后的网关条目。</summary>

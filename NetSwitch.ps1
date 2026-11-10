@@ -476,6 +476,27 @@ function Save-ConfigFile {
     Backup-ConfigFile -Path $Path
 
     $Data.updatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+
+    # 收敛点：序列化前先深拷贝一份，把值为 $null 的可选键剥离（未设置则不写该键），
+    # 避免旧配置文件读入再保存时凭空多出 dhcpStaticCoexist / ipv6Enabled；深拷贝是为了
+    # 不污染内存里的 $script:ConfigData。显式 $true / $false 都原样保留，「禁用」(false) 必须能落盘，
+    # 否则读入再保存会把用户在 profiles.json 手写的值抹掉。
+    $saveClone = ($Data | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+    foreach ($profileItem in (ConvertTo-Array $saveClone.profiles)) {
+        if ($null -eq $profileItem) { continue }
+        foreach ($ad in (ConvertTo-Array $profileItem.adapters)) {
+            if ($null -eq $ad) { continue }
+            foreach ($optKey in @('dhcpStaticCoexist', 'ipv6Enabled')) {
+                if ($ad.PSObject.Properties.Name -contains $optKey) {
+                    $optValue = $ad.$optKey
+                    if ($null -eq $optValue) {
+                        $ad.PSObject.Properties.Remove($optKey)
+                    }
+                }
+            }
+        }
+    }
+    $Data = $saveClone
     $json = $Data | ConvertTo-Json -Depth 12
     # 带 BOM 写入，保证 Windows 记事本打开不乱码
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($true)))
@@ -1193,6 +1214,42 @@ function Set-AdapterConfig {
 
     Write-NSLog "网卡「$name」(#$index) -> $(if ($isDhcp) { 'DHCP 自动获取' } else { '静态 IP' })"
 
+    # 可选：DHCP 与静态 IPv4 共存（dhcpStaticCoexist）。仅当配置显式启用时，必须在
+    # Reset-InterfaceIPv4 清空全部 IPv4 地址与默认路由之前先读出网卡上的静态地址与前缀，
+    # 打开 DhcpStaticIpCoexistence，待 DHCP 启用后再用 New-NetIPAddress 写回。
+    # 全程 try/catch + WARN，任何失败都不中断主流程。
+    $coexist       = $false
+    $savedStaticIP = @()
+    if ($isDhcp -and ($Config.PSObject.Properties.Name -contains 'dhcpStaticCoexist') -and $Config.dhcpStaticCoexist) {
+        $coexist = $true
+        try {
+            $savedStaticIP = @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                               Where-Object { $_.PrefixOrigin -eq 'Manual' -and $_.IPAddress -ne '127.0.0.1' } |
+                               ForEach-Object { [pscustomobject]@{ IPAddress = $_.IPAddress; PrefixLength = $_.PrefixLength } })
+        } catch {
+            Write-NSLog "  读取现有静态 IPv4 地址失败：$($_.Exception.Message)" 'WARN'
+        }
+        try {
+            Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -DhcpStaticIpCoexistence Enabled -ErrorAction SilentlyContinue
+        } catch {
+            Write-NSLog "  开启 DHCP/静态共存失败：$($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    # 可选：接管网卡的 IPv6 绑定（ipv6Enabled），与 $isDhcp 无关。
+    # 字段存在且为 $true 启用、为 $false 禁用；缺失或为 $null 时完全不动作，不接管现有绑定。
+    if ($Config.PSObject.Properties.Name -contains 'ipv6Enabled' -and $null -ne $Config.ipv6Enabled) {
+        try {
+            if ($Config.ipv6Enabled) {
+                Enable-NetAdapterBinding -Name $name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+            } else {
+                Disable-NetAdapterBinding -Name $name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Write-NSLog "  调整网卡「$name」IPv6 绑定失败：$($_.Exception.Message)" 'WARN'
+        }
+    }
+
     Reset-InterfaceIPv4 -InterfaceIndex $index
 
     if ($isDhcp) {
@@ -1212,6 +1269,18 @@ function Set-AdapterConfig {
         }
         if ($dnsList.Count -gt 0 -and -not $Config.dhcpDns) {
             Set-DnsClientServerAddress -InterfaceIndex $index -ServerAddresses $dnsList -ErrorAction SilentlyContinue
+        }
+        # DHCP 已启用、网卡稳定后，把 Reset 前保存的静态 IPv4 地址逐个写回，与 DHCP 租约地址共存；
+        # 每条单独 try/catch + WARN，失败不影响其余地址与主流程。
+        if ($coexist -and $savedStaticIP.Count -gt 0) {
+            foreach ($staticEntry in $savedStaticIP) {
+                try {
+                    New-NetIPAddress -InterfaceIndex $index -IPAddress $staticEntry.IPAddress -PrefixLength $staticEntry.PrefixLength -ErrorAction Stop | Out-Null
+                    Write-NSLog "  已保留静态地址 $($staticEntry.IPAddress)/$($staticEntry.PrefixLength)" 'OK'
+                } catch {
+                    Write-NSLog "  保留静态地址 $($staticEntry.IPAddress)/$($staticEntry.PrefixLength) 失败：$($_.Exception.Message)" 'WARN'
+                }
+            }
         }
         $dnsNote = if ($dnsList.Count -gt 0 -and -not $Config.dhcpDns) { 'DNS 固定为 ' + ($dnsList -join ', ') } else { 'DNS 自动' }
         Write-NSLog "  已切换为自动获取（$dnsNote）" 'OK'
@@ -1441,8 +1510,9 @@ function Show-CliMessageBox {
 # 冷启动约 1 秒，且耗时不再随网卡数量线性增长。
 # 万一 WMI 不可用（极少数精简/受限系统），自动退回原来的 cmdlet 实现，不影响可用性。
 function Get-StatusText {
+    param([switch]$ShowIPv6)
     try {
-        return (Get-StatusTextViaCim)
+        return (Get-StatusTextViaCim -ShowIPv6:$ShowIPv6)
     } catch {
         Write-NSLog "WMI 读取网络状态失败，已改用网卡 PowerShell 模块：$($_.Exception.Message)" 'WARN'
         return (Get-StatusTextViaCmdlet)
@@ -1450,6 +1520,7 @@ function Get-StatusText {
 }
 
 function Get-StatusTextViaCim {
+    param([switch]$ShowIPv6)
     $builder = New-Object System.Text.StringBuilder
 
     $cfgs = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = True' -ErrorAction Stop |
@@ -1517,6 +1588,12 @@ function Get-StatusTextViaCim {
 
         [void]$builder.AppendLine("    网关       : $gwText")
         [void]$builder.AppendLine("    DNS        : $dnsText")
+        if ($ShowIPv6) {
+            # IPv6 直接取同一个 $c.IPAddress 数组里不匹配 IPv4 正则的项，零新增 WMI 查询
+            $ipv6List = @($rawIps | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and [string]$_ -notmatch '^\d+\.\d+\.\d+\.\d+$' })
+            $ipv6Text = if ($ipv6List.Count -gt 0) { $ipv6List -join ', ' } else { '（无）' }
+            [void]$builder.AppendLine("    IPv6       : $ipv6Text")
+        }
         [void]$builder.AppendLine('')
     }
 
@@ -2738,9 +2815,13 @@ function Show-ProfileEditor {
     [void]$table.Columns.Add('Metric', [string])
     [void]$table.Columns.Add('DNS', [string])
     [void]$table.Columns.Add('Routes', [string])
+    [void]$table.Columns.Add('dhcpStaticCoexist', [string])
+    [void]$table.Columns.Add('ipv6Enabled', [string])
     $table.Columns['Enabled'].DefaultValue = $true
     $table.Columns['Mode'].DefaultValue    = '静态IP'
     $table.Columns['Mask'].DefaultValue    = '255.255.255.0'
+    $table.Columns['dhcpStaticCoexist'].DefaultValue = ''
+    $table.Columns['ipv6Enabled'].DefaultValue        = ''
 
     if ($null -ne $SourceProfile) {
         foreach ($ad in (ConvertTo-Array $SourceProfile.adapters)) {
@@ -2754,6 +2835,8 @@ function Show-ProfileEditor {
             $row['Metric']   = if ($null -ne $ad.defaultMetric) { [string]$ad.defaultMetric } else { '' }
             $row['DNS']      = ((ConvertTo-StringList $ad.dns) -join ';')
             $row['Routes']   = ((ConvertTo-StringList $ad.routes) -join ';')
+            $row['dhcpStaticCoexist'] = if (-not ($ad.PSObject.Properties.Name -contains 'dhcpStaticCoexist') -or $null -eq $ad.dhcpStaticCoexist) { '' } elseif ($ad.dhcpStaticCoexist) { '1' } else { '0' }
+            $row['ipv6Enabled']       = if (-not ($ad.PSObject.Properties.Name -contains 'ipv6Enabled') -or $null -eq $ad.ipv6Enabled) { '' } elseif ($ad.ipv6Enabled) { '1' } else { '0' }
             [void]$table.Rows.Add($row)
         }
     }
@@ -2779,44 +2862,53 @@ function Show-ProfileEditor {
 
     $colEnabled = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
     $colEnabled.Name = 'Enabled'; $colEnabled.DataPropertyName = 'Enabled'
-    $colEnabled.HeaderText = '启用'; $colEnabled.FillWeight = 22
+    $colEnabled.HeaderText = '启用'; $colEnabled.FillWeight = 20
 
     $colAdapter = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colAdapter.Name = 'Adapter'; $colAdapter.DataPropertyName = 'Adapter'
-    $colAdapter.HeaderText = '网卡名称/匹配(支持*)'; $colAdapter.FillWeight = 58
+    $colAdapter.HeaderText = '网卡名称/匹配(支持*)'; $colAdapter.FillWeight = 52
 
     $colMode = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
     $colMode.Name = 'Mode'; $colMode.DataPropertyName = 'Mode'
-    $colMode.HeaderText = '获取方式'; $colMode.FillWeight = 40
+    $colMode.HeaderText = '获取方式'; $colMode.FillWeight = 36
     [void]$colMode.Items.Add('静态IP')
     [void]$colMode.Items.Add('DHCP自动')
 
     $colIp = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colIp.Name = 'IP'; $colIp.DataPropertyName = 'IP'
-    $colIp.HeaderText = 'IP 地址'; $colIp.FillWeight = 46
+    $colIp.HeaderText = 'IP 地址'; $colIp.FillWeight = 42
 
     $colMask = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colMask.Name = 'Mask'; $colMask.DataPropertyName = 'Mask'
-    $colMask.HeaderText = '子网掩码'; $colMask.FillWeight = 44
+    $colMask.HeaderText = '子网掩码'; $colMask.FillWeight = 40
 
     $colGw = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colGw.Name = 'Gateways'; $colGw.DataPropertyName = 'Gateways'
-    $colGw.HeaderText = '网关[:跃点]'; $colGw.FillWeight = 56
+    $colGw.HeaderText = '网关[:跃点]'; $colGw.FillWeight = 48
 
     # 默认路由跃点数（可选）：留空=自动；填了就覆盖「单网关用系统默认值 / 多网关 10+序号」的行为
     $colMetric = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colMetric.Name = 'Metric'; $colMetric.DataPropertyName = 'Metric'
-    $colMetric.HeaderText = '默认跃点(可选)'; $colMetric.FillWeight = 34
+    $colMetric.HeaderText = '默认跃点(可选)'; $colMetric.FillWeight = 30
 
     $colDns = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colDns.Name = 'DNS'; $colDns.DataPropertyName = 'DNS'
-    $colDns.HeaderText = 'DNS 服务器'; $colDns.FillWeight = 54
+    $colDns.HeaderText = 'DNS 服务器'; $colDns.FillWeight = 46
 
     $colRoutes = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colRoutes.Name = 'Routes'; $colRoutes.DataPropertyName = 'Routes'
-    $colRoutes.HeaderText = '附加路由(可选)'; $colRoutes.FillWeight = 62
+    $colRoutes.HeaderText = '附加路由(可选)'; $colRoutes.FillWeight = 50
 
-    foreach ($col in @($colEnabled, $colAdapter, $colMode, $colIp, $colMask, $colGw, $colMetric, $colDns, $colRoutes)) {
+    # 两个可选开关（TextBox 三态列）：空=未设置(不写键)、1=启用(true)、0=禁用(false)
+    $colCoexist = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colCoexist.Name = 'dhcpStaticCoexist'; $colCoexist.DataPropertyName = 'dhcpStaticCoexist'
+    $colCoexist.HeaderText = '静态共存 空/1/0'; $colCoexist.FillWeight = 26
+
+    $colIpv6 = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colIpv6.Name = 'ipv6Enabled'; $colIpv6.DataPropertyName = 'ipv6Enabled'
+    $colIpv6.HeaderText = 'IPv6 空/1/0'; $colIpv6.FillWeight = 26
+
+    foreach ($col in @($colEnabled, $colAdapter, $colMode, $colIp, $colMask, $colGw, $colMetric, $colDns, $colRoutes, $colCoexist, $colIpv6)) {
         [void]$grid.Columns.Add($col)
     }
 
@@ -2878,6 +2970,8 @@ function Show-ProfileEditor {
         $newRow['Metric']   = ''
         $newRow['DNS']      = ''
         $newRow['Routes']   = ''
+        $newRow['dhcpStaticCoexist'] = ''
+        $newRow['ipv6Enabled']       = ''
         [void]$table.Rows.Add($newRow)
         & $updateEmptyHint
     }
@@ -2901,6 +2995,8 @@ function Show-ProfileEditor {
         $newRow['Metric']   = ''
         $newRow['DNS']      = ''
         $newRow['Routes']   = ''
+        $newRow['dhcpStaticCoexist'] = ''
+        $newRow['ipv6Enabled']       = ''
         [void]$table.Rows.Add($newRow)
         & $updateEmptyHint
     })
@@ -2943,19 +3039,27 @@ function Show-ProfileEditor {
             $dnsText = [string]$row['DNS']
             $dnsArray = @(Split-ItemList $dnsText)
 
-            $adapterList += [pscustomobject][ordered]@{
+            $entry = [pscustomobject][ordered]@{
                 # 存 MAC：用户填的是网卡名，这里换成该网卡的 MAC，以后改名也不会失效
                 adapter  = ConvertTo-AdapterStorageValue $adapterName
                 enabled  = [bool]$row['Enabled']
                 mode     = if ($modeText -eq 'DHCP自动') { 'dhcp' } else { 'static' }
                 ip       = ([string]$row['IP']).Trim()
                 mask     = ([string]$row['Mask']).Trim()
-                gateways = @(Split-ItemList ([string]$row['Gateways']))
-                dns      = $dnsArray
                 dhcpDns  = ($dnsArray.Count -eq 0)
                 defaultMetric = ConvertTo-MetricValue ([string]$row['Metric'])
+                gateways = @(Split-ItemList ([string]$row['Gateways']))
+                dns      = $dnsArray
                 routes   = @(Split-ItemList ([string]$row['Routes']))
             }
+            # 两个可选开关（三态）：空=未设置(不添加属性)、1=启用($true)、0=禁用($false)。
+            # 按字段分组、固定顺序 Add-Member：dhcpStaticCoexist 在前、ipv6Enabled 在后，
+            # 与 C# 版 PsJson.cs 的条件性 members.Add 顺序一致，保证两版写出的属性顺序一致。
+            if (([string]$row['dhcpStaticCoexist']) -eq '1') { $entry | Add-Member NoteProperty dhcpStaticCoexist $true }
+            if (([string]$row['dhcpStaticCoexist']) -eq '0') { $entry | Add-Member NoteProperty dhcpStaticCoexist $false }
+            if (([string]$row['ipv6Enabled']) -eq '1')       { $entry | Add-Member NoteProperty ipv6Enabled       $true }
+            if (([string]$row['ipv6Enabled']) -eq '0')       { $entry | Add-Member NoteProperty ipv6Enabled       $false }
+            $adapterList += $entry
         }
 
         $script:EditorResult = [pscustomobject][ordered]@{
@@ -3526,7 +3630,7 @@ function Show-MainForm {
 
     $refreshStatus = {
         try {
-            $txtStatus.Text = (Get-StatusText)
+            $txtStatus.Text = (Get-StatusText -ShowIPv6)
         } catch {
             $txtStatus.Text = "读取网络状态失败：$($_.Exception.Message)"
         }

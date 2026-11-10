@@ -34,7 +34,7 @@ public sealed class StatusReader : IStatusReader
     }
 
     /// <inheritdoc />
-    public string GetStatusText()
+    public string GetStatusText(bool includeIpv6 = false)
     {
         var builder = new StringBuilder(1024);
 
@@ -86,6 +86,17 @@ public sealed class StatusReader : IStatusReader
 
             builder.AppendLine($"    网关       : {(gateways.Count > 0 ? string.Join(", ", gateways) : "（无）")}");
             builder.AppendLine($"    DNS        : {(dns.Count > 0 ? string.Join(", ", dns) : "（自动/无）")}");
+
+            // 仅 GUI 状态卡片显式开启时追加 IPv6 行；默认（CLI / 旧调用）输出逐字不变，
+            // 含行标签、空格、顺序与末尾空行都保持原样。
+            if (includeIpv6)
+            {
+                var ipv6 = adapter.Ipv6Addresses is { Count: > 0 }
+                    ? string.Join(", ", adapter.Ipv6Addresses)
+                    : "（无）";
+                builder.AppendLine($"    IPv6       : {ipv6}");
+            }
+
             builder.AppendLine();
         }
 
